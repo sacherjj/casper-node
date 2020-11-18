@@ -38,6 +38,7 @@ PREFIX = "04000000"
 ERA_ID_LEN = 16
 VALIDATOR_COUNT_LEN = 8
 KEY_LEN = 66
+value_set = set()
 
 
 def _era_to_decimal(era_hex) -> int:
@@ -71,10 +72,13 @@ def _get_u512_data(data, cur_pos) -> (int, int):
     u512_len = int(data[cur_pos:cur_pos+2], 16)
     cur_pos += 2
     raw_u512_hex = data[cur_pos:cur_pos+2*u512_len]
-    padded_u512 = raw_u512_hex + '0000000000000000'[len(raw_u512_hex):]
+    u512_bytes = bytes.fromhex(raw_u512_hex)
+    accum = 0
+    for b_val in reversed(u512_bytes):
+        accum <<= 8
+        accum += b_val
     cur_pos += 2*u512_len
-    bond_value = struct.unpack('<Q', bytes.fromhex(padded_u512))[0]
-    return cur_pos, bond_value
+    return cur_pos, accum
 
 
 def _get_validator_data(data, cur_pos) -> (int, list):

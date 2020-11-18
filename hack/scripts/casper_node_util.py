@@ -156,7 +156,7 @@ def save_validator_by_key(era_validators):
             validators[key] += [keys_in_era.get(key, 0)]
     valid_by_era_path = pathlib.Path(os.path.realpath(__file__)).parent / "validators_by_era.csv"
     with open(valid_by_era_path, "w+") as f:
-        f.write(f"era_id,bonded_validator_count,in_era_auction,{','.join(all_keys)}\n")
+        f.write(f"era_id,bonded_validator_count,{','.join(all_keys)}\n")
         for era_id in range(len(era_validators)):
             f.write(f"{era_id}")
             # Get count of non-zero bond validators

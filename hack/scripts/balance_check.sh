@@ -13,7 +13,7 @@ fi
 
 INPUT_HEX=$1
 # can point to server if not run locally
-NODE_ADDRESS='http://127.0.0.1:7777'
+NODE_ADDRESS='http://54.177.84.9:7777'
 
 # -----------------------------------------------------------------------
 
