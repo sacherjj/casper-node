@@ -24,23 +24,49 @@ from era_validators import parse_era_validators
 # hash-2141636bcf5e15ecced219e53c813b96f99ec8a3bbe31066872b61be49355ce2
 AUCTION_HASH = 'hash-0681e58982fc60e93ca415f80327f4b8888435064503672f78b294fc96521aa7'
 
-NODE_ADDRESS = 'http://54.177.84.9:7777'
+NODE_ADDRESS = 'http://54.67.67.33:7777'
+CHAIN_NAME = 'casper-delta-2'
 
 GET_GLOBAL_STATE_COMMAND = ["casper-client", "get-global-state-hash", "--node-address", NODE_ADDRESS]
 
+CL_NODE_ADDRESSES = ['http://54.177.84.9:7777', 'http://3.16.135.188:7777', 'http://18.144.69.216:7777',
+                     'http://13.57.251.65:7777', 'http://3.14.69.138:7777']
+OTHER_NODE_ADDRESSES = ['http://34.220.39.73:7777', ]
 
-def _subprocess_call(command, expect_text) -> dict:
+
+def _subprocess_call(command, expect_text) -> str:
     process = subprocess.Popen(command,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE)
     stdout, stderr = process.communicate(timeout=30)
     if expect_text.encode('utf-8') not in stdout:
         raise Exception(f"Command: {command}\n {stderr.decode('utf-8')}")
-    return json.loads(stdout.decode('utf-8'))
+    return stdout.decode('utf-8')
+
+
+def _subprocess_call_with_json(command, expect_text) -> dict:
+    return json.loads(_subprocess_call(command, expect_text))
+
+
+def deploy_do_nothing_to_node(node_addr):
+    wasm = '/home/sacherjj/repos/casper-node/target/wasm32-unknown-unknown/release/do_nothing.wasm'
+    secret_key = '/home/sacherjj/aws/keys/N0/secret_key.pem'
+    command = ["casper-client", "put-deploy",
+               "--node-address", node_addr,
+               "--chain-name", CHAIN_NAME,
+               "--secret-key", secret_key,
+               "--session-path", wasm,
+               "--payment-amount", "10000000000"]
+    print(_subprocess_call(command, ''))
+
+
+def deploy_saved_deploy_to_node(node_addr, deploy_file):
+    command = ["casper-client", "send-deploy", "-i", deploy_file, "--node-address", node_addr]
+    print(_subprocess_call(command, ''))
 
 
 def get_global_state_hash():
-    response = _subprocess_call(GET_GLOBAL_STATE_COMMAND, "global_state_hash")
+    response = _subprocess_call_with_json(GET_GLOBAL_STATE_COMMAND, "global_state_hash")
     return response["global_state_hash"]
 
 
@@ -50,7 +76,7 @@ def get_era_validators(global_state_hash):
                "-k", AUCTION_HASH,
                "-s", global_state_hash,
                "-q", "era_validators"]
-    response = _subprocess_call(command, "stored_value")
+    response = _subprocess_call_with_json(command, "stored_value")
     era_validator_bytes = response["result"]["stored_value"]["CLValue"]["serialized_bytes"]
     return parse_era_validators(era_validator_bytes)
 
@@ -61,7 +87,7 @@ def get_block(block_hash=None):
     if block_hash:
         command.append("-b")
         command.append(block_hash)
-    return _subprocess_call(command, "block")
+    return _subprocess_call_with_json(command, "block")
 
 
 def get_all_blocks():
@@ -95,7 +121,9 @@ def get_all_blocks():
 
 # current_global_state_hash = get_global_state_hash()
 # print(get_era_validators(current_global_state_hash))
-all_blocks = get_all_blocks()
+# all_blocks = get_all_blocks()
+
+
 #
 
 
@@ -109,23 +137,23 @@ def unique_state_root_hashes(blocks):
             yield header['era_id'], header['height'], srh
 
 
-def state_root_hash_by_era(blocks):
+def state_root_hash_by_era():
     pre_era = ''
-    for block in blocks:
+    for block in get_all_blocks():
         era_id = block["header"]["era_id"]
         if era_id != pre_era:
             pre_era = era_id
             yield era_id, block["header"]["state_root_hash"]
 
 
-def filtered_era_validators(blocks):
+def filtered_era_validators():
     cached_eras_file = pathlib.Path(os.path.realpath(__file__)).parent / "era_validator_cache"
     if pathlib.Path.exists(cached_eras_file):
         eras = pickle.load(open(cached_eras_file, "rb"))
     else:
         eras = []
     pre_eras = [era[0] for era in eras]
-    for era_id, srh in state_root_hash_by_era(all_blocks):
+    for era_id, srh in state_root_hash_by_era(get_all_blocks()):
         if era_id in pre_eras:
             continue
         era_val = get_era_validators(srh)
@@ -174,13 +202,34 @@ def save_block_info():
         f.write("era_id,height,hash,proposer\n")
         all_blocks = get_all_blocks()
         for block in all_blocks:
-            f.write(f'{block["header"]["era_id"]},{block["header"]["height"]},{block["hash"]},{block["header"]["proposer"]}\n')
+            f.write(
+                f'{block["header"]["era_id"]},{block["header"]["height"]},{block["hash"]},{block["header"]["proposer"]}\n')
 
 
-save_block_info()
-era_validators = filtered_era_validators(all_blocks)
-save_validator_by_key(era_validators)
+def get_deploy_hashs_per_block():
+    for block in get_all_blocks():
+        header = block['header']
+        if header['height'] < 999:
+            continue
+        print(f"{header['era_id']} - {header['height']} - {header['proposer']} - {header['deploy_hashes']}")
+
+
+# save_block_info()
+get_deploy_hashs_per_block()
+
+
+# era_validators = filtered_era_validators(all_blocks)
+# save_validator_by_key(era_validators)
 
 # state_root_hash_by_era(all_blocks)
 
 # print(get_era_validators(all_blocks[-1]["header"]["state_root_hash"]))
+
+#
+# for i in range(10):
+#     for node in CL_NODE_ADDRESSES:
+#          deploy_do_nothing_to_node(node)
+#     time.sleep(65.5)
+
+# for node in CL_NODE_ADDRESSES:
+#     deploy_saved_deploy_to_node(node, '~/repos/casper-node/do_nothing_deploy')
