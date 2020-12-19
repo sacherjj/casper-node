@@ -57,7 +57,7 @@ bind_address = '0.0.0.0:34553'
 #
 # Multiple addresses can be given and the node will attempt to connect to each, requiring at least
 # one connection.
-known_addresses = ['54.177.84.9:34553','18.144.69.216:34553','13.57.251.65:34553']
+known_addresses = ['54.177.84.9:34553', '18.144.69.216:34553', '13.57.251.65:34553']
 
 # The interval (in milliseconds) between each fresh round of gossiping the node's public address.
 gossip_interval = 120_000
@@ -69,22 +69,51 @@ gossip_interval = 120_000
 # only in the unit files themselves via `-C=network.systemd_support=true`.
 systemd_support = false
 
-# =============================================
-# Configuration options for the HTTP API server
-# =============================================
-[http_server]
 
-# Listening address for HTTP server.  If the port is set to 0, a random port will be used.
+# =============================================
+# Configuration options for the JSON-RPC HTTP server
+# =============================================
+[rpc_server]
+
+# Listening address for JSON-RPC HTTP server.  If the port is set to 0, a random port will be used.
 #
 # If the specified port cannot be bound to, a random port will be tried instead.  If binding fails,
-# the HTTP server will not run, but the node will be otherwise unaffected.
+# the JSON-RPC HTTP server will not run, but the node will be otherwise unaffected.
 #
 # The actual bound address will be reported via a log line if logging is enabled.
 address = '0.0.0.0:7777'
 
-# The number of event-stream events to buffer.
+# =============================================
+# Configuration options for the REST HTTP server
+# =============================================
+[rest_server]
+
+# Listening address for REST HTTP server.  If the port is set to 0, a random port will be used.
+#
+# If the specified port cannot be bound to, a random port will be tried instead.  If binding fails,
+# the REST HTTP server will not run, but the node will be otherwise unaffected.
+#
+# The actual bound address will be reported via a log line if logging is enabled.
+address = '0.0.0.0:8888'
+
+# =============================================
+# Configuration options for the SSE HTTP event stream server
+# =============================================
+[event_stream_server]
+
+# Listening address for SSE HTTP event stream server.  If the port is set to 0, a random port will be used.
+#
+# If the specified port cannot be bound to, a random port will be tried instead.  If binding fails,
+# the SSE HTTP event stream server will not run, but the node will be otherwise unaffected.
+#
+# The actual bound address will be reported via a log line if logging is enabled.
+address = '0.0.0.0:9999'
+
+# The number of event stream events to buffer.
 event_stream_buffer_length = 100
 
+# The capacity of the broadcast channel size.
+broadcast_channel_size = 100
 
 # ===============================================
 # Configuration options for the storage component
@@ -99,34 +128,33 @@ event_stream_buffer_length = 100
 # If unset, the path must be supplied as an argument via the CLI.
 path = '/root/.local/share/casper-node'
 
-# Optional maximum size of the database to use for the block store.
-#
-# If unset, defaults to 483,183,820,800 == 450 GiB.
+# Maximum size of the database to use for the block store.
 #
 # The size should be a multiple of the OS page size.
-#max_block_store_size = 483183820800
-
-# Optional maximum size of the database to use for the deploy store.
 #
-# If unset, defaults to 322,122,547,200 == 300 GiB.
+# 483_183_820_800 == 450 GiB.
+max_block_store_size = 483_183_820_800
+
+# Maximum size of the database to use for the deploy store.
 #
 # The size should be a multiple of the OS page size.
-#max_deploy_store_size = 322122547200
-
-# Optional maximum size of the database to use for the block height store.
 #
-# If unset, defaults to 10,485,100 == 10 MiB.
+# 322_122_547_200 == 300 GiB.
+max_deploy_store_size = 322_122_547_200
+
+# Maximum size of the database to use for the deploy metadata.
 #
 # The size should be a multiple of the OS page size.
-#max_block_height_store_size = 10485100
-
-# Optional maximum size of the database to use for the chainspec store.
 #
-# If unset, defaults to 1,073,741,824 == 1 GiB.
+# 322_122_547_200 == 300 GiB.
+max_deploy_metadata_store_size = 322_122_547_200
+
+# Maximum size of the database to use for the state snapshots.
 #
 # The size should be a multiple of the OS page size.
-#max_chainspec_store_size = 1073741824
-
+#
+# 10_737_418_240 == 10 GiB.
+max_state_store_size = 10_737_418_240
 
 # ===================================
 # Configuration options for gossiping

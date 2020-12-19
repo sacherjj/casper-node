@@ -1,50 +1,31 @@
 #!/usr/bin/env bash
-#
-# Renders account information to stdout.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifier.
-#   Node ordinal identifier.
-#   Chain root state hash.
-#   Account key.
 
-# Import utils.
-source $NCTL/sh/utils/misc.sh
+source $NCTL/sh/utils.sh
 
-#######################################
-# Destructure input args.
-#######################################
-
-# Unset to avoid parameter collisions.
-unset account_key
-unset net
-unset node
-unset state_root_hash
+unset ACCOUNT_KEY
+unset NET_ID
+unset NODE_ID
+unset STATE_ROOT_HASH
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        account-key) account_key=${VALUE} ;;
-        root-hash) state_root_hash=${VALUE} ;;
-        net) net=${VALUE} ;;
-        node) node=${VALUE} ;;
+        account-key) ACCOUNT_KEY=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        node) NODE_ID=${VALUE} ;;
+        root-hash) STATE_ROOT_HASH=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-net=${net:-1}
-node=${node:-1}
+NET_ID=${NET_ID:-1}
+NODE_ID=${NODE_ID:-1}
+STATE_ROOT_HASH=${STATE_ROOT_HASH:-$(get_state_root_hash $NET_ID $NODE_ID)}
 
-#######################################
-# Main
-#######################################
-
-$NCTL/assets/net-$net/bin/casper-client query-state \
-    --node-address $(get_node_address $net $node) \
-    --state-root-hash $state_root_hash \
-    --key $account_key \
-    | jq '.result.stored_value'
+$(get_path_to_client $NET_ID) query-state \
+    --node-address $(get_node_address_rpc $NET_ID $NODE_ID) \
+    --state-root-hash $STATE_ROOT_HASH \
+    --key $ACCOUNT_KEY \
+    | jq '.result'

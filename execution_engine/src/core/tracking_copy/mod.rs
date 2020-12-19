@@ -90,7 +90,7 @@ impl Query {
     fn current_path(&self) -> String {
         let mut path = format!("{:?}", self.base_key);
         for name in &self.visited_names {
-            path.push_str("/");
+            path.push('/');
             path.push_str(name);
         }
         path
@@ -423,6 +423,9 @@ impl<R: StateReader<Key, StoredValue>> TrackingCopy<R> {
                 }
                 StoredValue::DeployInfo(_) => {
                     return Ok(query.into_not_found_result(&"DeployInfo value found."));
+                }
+                StoredValue::EraInfo(_) => {
+                    return Ok(query.into_not_found_result(&"EraInfo value found."));
                 }
             }
         }

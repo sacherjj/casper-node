@@ -1,5 +1,7 @@
+use std::fs::File;
+
 use futures::executor;
-use jsonrpc_lite::{JsonRpc, Params};
+use jsonrpc_lite::{Id, JsonRpc, Params};
 use rand::Rng;
 use reqwest::Client;
 use serde::Serialize;
@@ -11,8 +13,10 @@ use casper_node::{
     rpcs::{
         account::{PutDeploy, PutDeployParams},
         chain::{
-            BlockIdentifier, GetBlock, GetBlockParams, GetStateRootHash, GetStateRootHashParams,
+            BlockIdentifier, GetBlock, GetBlockParams, GetBlockTransfers, GetBlockTransfersParams,
+            GetEraInfoBySwitchBlock, GetEraInfoParams, GetStateRootHash, GetStateRootHashParams,
         },
+        docs::ListRpcs,
         info::{GetDeploy, GetDeployParams},
         state::{GetAuctionInfo, GetBalance, GetBalanceParams, GetItem, GetItemParams},
         RpcWithOptionalParams, RpcWithParams, RpcWithoutParams, RPC_API_PATH,
@@ -24,7 +28,7 @@ use casper_types::{bytesrepr::ToBytes, Key, RuntimeArgs, URef, U512};
 use crate::{
     deploy::{DeployExt, DeployParams, SendDeploy, Transfer},
     error::{Error, Result},
-    merkle_proofs,
+    validation,
 };
 
 /// Target for a given transfer.
@@ -36,11 +40,9 @@ pub(crate) enum TransferTarget {
 }
 
 /// Struct representing a single JSON-RPC call to the casper node.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RpcCall {
-    // TODO - If/when https://github.com/AtsukiTak/warp-json-rpc/pull/1 is merged and published,
-    //        change `rpc_id` to a `jsonrpc_lite::Id`.
-    rpc_id: u32,
+    rpc_id: Id,
     node_address: String,
     verbose: bool,
 }
@@ -58,20 +60,25 @@ impl RpcCall {
     /// When `verbose` is `true`, the request will be printed to `stdout`.
     pub(crate) fn new(maybe_rpc_id: &str, node_address: &str, verbose: bool) -> Result<Self> {
         let rpc_id = if maybe_rpc_id.is_empty() {
-            rand::thread_rng().gen()
+            Id::from(rand::thread_rng().gen::<i64>())
+        } else if let Ok(i64_id) = maybe_rpc_id.parse::<i64>() {
+            Id::from(i64_id)
         } else {
-            maybe_rpc_id.parse()?
+            Id::from(maybe_rpc_id.to_string())
         };
 
         Ok(Self {
             rpc_id,
-            node_address: node_address.to_string(),
+            node_address: node_address.trim_end_matches('/').to_string(),
             verbose,
         })
     }
 
     pub(crate) fn get_deploy(self, deploy_hash: &str) -> Result<JsonRpc> {
-        let hash = Digest::from_hex(deploy_hash)?;
+        let hash = Digest::from_hex(deploy_hash).map_err(|error| Error::CryptoError {
+            context: "deploy_hash",
+            error,
+        })?;
         let params = GetDeployParams {
             deploy_hash: DeployHash::new(hash),
         };
@@ -79,7 +86,11 @@ impl RpcCall {
     }
 
     pub(crate) fn get_item(self, state_root_hash: &str, key: &str, path: &str) -> Result<JsonRpc> {
-        let state_root_hash = Digest::from_hex(state_root_hash)?;
+        let state_root_hash =
+            Digest::from_hex(state_root_hash).map_err(|error| Error::CryptoError {
+                context: "state_root_hash",
+                error,
+            })?;
 
         let key = {
             if let Ok(key) = Key::from_formatted_str(key) {
@@ -103,7 +114,7 @@ impl RpcCall {
             path: path.clone(),
         };
         let response = GetItem::request_with_map_params(self, params)?;
-        merkle_proofs::validate_query_response(&response, &state_root_hash, &key, &path)?;
+        validation::validate_query_response(&response, &state_root_hash, &key, &path)?;
         Ok(response)
     }
 
@@ -118,8 +129,13 @@ impl RpcCall {
     }
 
     pub(crate) fn get_balance(self, state_root_hash: &str, purse_uref: &str) -> Result<JsonRpc> {
-        let state_root_hash = Digest::from_hex(state_root_hash)?;
-        let uref = URef::from_formatted_str(purse_uref)?;
+        let state_root_hash =
+            Digest::from_hex(state_root_hash).map_err(|error| Error::CryptoError {
+                context: "state_root_hash",
+                error,
+            })?;
+        let uref = URef::from_formatted_str(purse_uref)
+            .map_err(|error| Error::FailedToParseURef("purse_uref", error))?;
         let key = Key::from(uref);
 
         let params = GetBalanceParams {
@@ -127,7 +143,22 @@ impl RpcCall {
             purse_uref: purse_uref.to_string(),
         };
         let response = GetBalance::request_with_map_params(self, params)?;
-        merkle_proofs::validate_get_balance_response(&response, &state_root_hash, &key)?;
+        validation::validate_get_balance_response(&response, &state_root_hash, &key)?;
+        Ok(response)
+    }
+
+    pub(crate) fn get_era_info_by_switch_block(
+        self,
+        maybe_block_identifier: &str,
+    ) -> Result<JsonRpc> {
+        let response = match Self::block_identifier(maybe_block_identifier)? {
+            None => GetEraInfoBySwitchBlock::request(self),
+            Some(block_identifier) => {
+                let params = GetEraInfoParams { block_identifier };
+                GetEraInfoBySwitchBlock::request_with_map_params(self, params)
+            }
+        }?;
+        validation::validate_get_era_info_response(&response)?;
         Ok(response)
     }
 
@@ -135,17 +166,23 @@ impl RpcCall {
         GetAuctionInfo::request(self)
     }
 
+    pub(crate) fn list_rpcs(self) -> Result<JsonRpc> {
+        ListRpcs::request(self)
+    }
+
     pub(crate) fn transfer(
         self,
         amount: U512,
         source_purse: Option<URef>,
         target: TransferTarget,
+        id: Option<u64>,
         deploy_params: DeployParams,
         payment: ExecutableDeployItem,
     ) -> Result<JsonRpc> {
         const TRANSFER_ARG_AMOUNT: &str = "amount";
         const TRANSFER_ARG_SOURCE: &str = "source";
         const TRANSFER_ARG_TARGET: &str = "target";
+        const TRANSFER_ARG_ID: &str = "id";
 
         let mut transfer_args = RuntimeArgs::new();
         transfer_args.insert(TRANSFER_ARG_AMOUNT, amount);
@@ -161,8 +198,9 @@ impl RpcCall {
                 transfer_args.insert(TRANSFER_ARG_TARGET, target_purse);
             }
         }
+        transfer_args.insert(TRANSFER_ARG_ID, id);
         let session = ExecutableDeployItem::Transfer {
-            args: transfer_args.to_bytes()?,
+            args: transfer_args.to_bytes()?.into(),
         };
         let deploy = Deploy::with_payment_and_session(deploy_params, payment, session);
         let params = PutDeployParams { deploy };
@@ -170,7 +208,11 @@ impl RpcCall {
     }
 
     pub(crate) fn send_deploy_file(self, input_path: &str) -> Result<JsonRpc> {
-        let deploy = Deploy::read_deploy(input_path)?;
+        let input = File::open(input_path).map_err(|error| Error::IoError {
+            context: format!("unable to read input file '{}'", input_path),
+            error,
+        })?;
+        let deploy = Deploy::read_deploy(input)?;
         let params = PutDeployParams { deploy };
         SendDeploy::request_with_map_params(self, params)
     }
@@ -181,13 +223,28 @@ impl RpcCall {
     }
 
     pub(crate) fn get_block(self, maybe_block_identifier: &str) -> Result<JsonRpc> {
-        match Self::block_identifier(maybe_block_identifier)? {
+        let maybe_block_identifier = Self::block_identifier(maybe_block_identifier)?;
+        let response = match maybe_block_identifier {
             Some(block_identifier) => {
                 let params = GetBlockParams { block_identifier };
                 GetBlock::request_with_map_params(self, params)
             }
             None => GetBlock::request(self),
-        }
+        }?;
+        validation::validate_get_block_response(&response, &maybe_block_identifier)?;
+        Ok(response)
+    }
+
+    pub(crate) fn get_block_transfers(self, maybe_block_identifier: &str) -> Result<JsonRpc> {
+        let maybe_block_identifier = Self::block_identifier(maybe_block_identifier)?;
+        let response = match maybe_block_identifier {
+            Some(block_identifier) => {
+                let params = GetBlockTransfersParams { block_identifier };
+                GetBlockTransfers::request_with_map_params(self, params)
+            }
+            None => GetBlockTransfers::request(self),
+        }?;
+        Ok(response)
     }
 
     fn block_identifier(maybe_block_identifier: &str) -> Result<Option<BlockIdentifier>> {
@@ -196,17 +253,23 @@ impl RpcCall {
         }
 
         if maybe_block_identifier.len() == (Digest::LENGTH * 2) {
-            let hash = Digest::from_hex(maybe_block_identifier)?;
+            let hash =
+                Digest::from_hex(maybe_block_identifier).map_err(|error| Error::CryptoError {
+                    context: "block_identifier",
+                    error,
+                })?;
             Ok(Some(BlockIdentifier::Hash(BlockHash::new(hash))))
         } else {
-            let height = maybe_block_identifier.parse()?;
+            let height = maybe_block_identifier
+                .parse()
+                .map_err(|error| Error::FailedToParseInt("block_identifier", error))?;
             Ok(Some(BlockIdentifier::Height(height)))
         }
     }
 
     async fn request(self, method: &str, params: Params) -> Result<JsonRpc> {
         let url = format!("{}/{}", self.node_address, RPC_API_PATH);
-        let rpc_req = JsonRpc::request_with_params(self.rpc_id as i64, method, params);
+        let rpc_req = JsonRpc::request_with_params(self.rpc_id, method, params);
 
         if self.verbose {
             println!(
@@ -289,6 +352,10 @@ impl RpcClient for GetBlock {
     const RPC_METHOD: &'static str = Self::METHOD;
 }
 
+impl RpcClient for GetBlockTransfers {
+    const RPC_METHOD: &'static str = Self::METHOD;
+}
+
 impl RpcClient for GetStateRootHash {
     const RPC_METHOD: &'static str = Self::METHOD;
 }
@@ -297,7 +364,15 @@ impl RpcClient for GetItem {
     const RPC_METHOD: &'static str = <Self as RpcWithParams>::METHOD;
 }
 
+impl RpcClient for GetEraInfoBySwitchBlock {
+    const RPC_METHOD: &'static str = Self::METHOD;
+}
+
 impl RpcClient for GetAuctionInfo {
+    const RPC_METHOD: &'static str = Self::METHOD;
+}
+
+impl RpcClient for ListRpcs {
     const RPC_METHOD: &'static str = Self::METHOD;
 }
 
@@ -315,7 +390,10 @@ pub(crate) trait IntoJsonMap: Serialize {
 
 impl IntoJsonMap for PutDeployParams {}
 impl IntoJsonMap for GetBlockParams {}
+impl IntoJsonMap for GetBlockTransfersParams {}
 impl IntoJsonMap for GetStateRootHashParams {}
 impl IntoJsonMap for GetDeployParams {}
 impl IntoJsonMap for GetBalanceParams {}
 impl IntoJsonMap for GetItemParams {}
+impl IntoJsonMap for GetEraInfoParams {}
+impl IntoJsonMap for ListRpcs {}

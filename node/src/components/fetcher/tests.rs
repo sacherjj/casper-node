@@ -1,12 +1,8 @@
 #![cfg(test)]
-use std::{
-    fmt::{self, Debug, Display, Formatter},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
-use derive_more::From;
+use casper_node_macros::reactor;
 use futures::FutureExt;
-use prometheus::Registry;
 use tempfile::TempDir;
 use thiserror::Error;
 use tokio::time;
@@ -14,77 +10,20 @@ use tokio::time;
 use super::*;
 use crate::{
     components::{
-        chainspec_loader::Chainspec,
-        deploy_acceptor::{self, DeployAcceptor},
-        in_memory_network::{InMemoryNetwork, NetworkController, NodeId},
-        storage::{self, Storage, StorageType},
+        chainspec_loader::Chainspec, deploy_acceptor, in_memory_network::NetworkController, storage,
     },
-    effect::{
-        announcements::{ApiServerAnnouncement, DeployAcceptorAnnouncement, NetworkAnnouncement},
-        requests::FetcherRequest,
-    },
+    effect::announcements::{DeployAcceptorAnnouncement, NetworkAnnouncement},
     protocol::Message,
-    reactor::{self, EventQueueHandle, Runner},
+    reactor::{Reactor as ReactorTrait, Runner},
     testing::{
         network::{Network, NetworkedReactor},
         ConditionCheckReactor, TestRng,
     },
-    types::{Deploy, DeployHash, Tag},
+    types::{Deploy, DeployHash, NodeId},
     utils::{Loadable, WithDir},
-    FetcherConfig,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Top-level event for the reactor.
-#[derive(Debug, From)]
-#[must_use]
-enum Event {
-    #[from]
-    Storage(storage::Event<Storage>),
-    #[from]
-    DeployAcceptor(deploy_acceptor::Event),
-    #[from]
-    DeployFetcher(super::Event<Deploy>),
-    #[from]
-    DeployFetcherRequest(FetcherRequest<NodeId, Deploy>),
-    #[from]
-    NetworkRequest(NetworkRequest<NodeId, Message>),
-    #[from]
-    LinearChainRequest(LinearChainRequest<NodeId>),
-    #[from]
-    NetworkAnnouncement(NetworkAnnouncement<NodeId, Message>),
-    #[from]
-    ApiServerAnnouncement(ApiServerAnnouncement),
-    #[from]
-    DeployAcceptorAnnouncement(DeployAcceptorAnnouncement<NodeId>),
-}
-
-impl From<StorageRequest<Storage>> for Event {
-    fn from(request: StorageRequest<Storage>) -> Self {
-        Event::Storage(storage::Event::Request(request))
-    }
-}
-
-impl Display for Event {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Event::Storage(event) => write!(formatter, "storage: {}", event),
-            Event::DeployAcceptor(event) => write!(formatter, "deploy acceptor: {}", event),
-            Event::DeployFetcher(event) => write!(formatter, "fetcher: {}", event),
-            Event::NetworkRequest(req) => write!(formatter, "network request: {}", req),
-            Event::DeployFetcherRequest(req) => write!(formatter, "fetcher request: {}", req),
-            Event::NetworkAnnouncement(ann) => write!(formatter, "network announcement: {}", ann),
-            Event::ApiServerAnnouncement(ann) => {
-                write!(formatter, "api server announcement: {}", ann)
-            }
-            Event::DeployAcceptorAnnouncement(ann) => {
-                write!(formatter, "deploy-acceptor announcement: {}", ann)
-            }
-            Event::LinearChainRequest(req) => write!(formatter, "linear chain request: {}", req),
-        }
-    }
-}
 
 /// Error type returned by the test reactor.
 #[derive(Debug, Error)]
@@ -93,157 +32,136 @@ enum Error {
     Metrics(#[from] prometheus::Error),
 }
 
-struct Reactor {
-    network: InMemoryNetwork<Message>,
-    storage: Storage,
-    deploy_acceptor: DeployAcceptor,
-    deploy_fetcher: Fetcher<Deploy>,
-    _storage_tempdir: TempDir,
-}
-
 impl Drop for Reactor {
     fn drop(&mut self) {
         NetworkController::<Message>::remove_node(&self.network.node_id())
     }
 }
 
-impl reactor::Reactor for Reactor {
-    type Event = Event;
-    type Config = Config;
-    type Error = Error;
+#[derive(Debug)]
+pub struct FetcherTestConfig {
+    fetcher_config: Config,
+    storage_config: storage::Config,
+    temp_dir: TempDir,
+}
 
-    fn new(
-        config: Self::Config,
-        _registry: &Registry,
-        event_queue: EventQueueHandle<Self::Event>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<(Self, Effects<Self::Event>), Self::Error> {
-        let network = NetworkController::create_node(event_queue, rng);
+impl Default for FetcherTestConfig {
+    fn default() -> Self {
+        let (storage_config, temp_dir) = storage::Config::default_for_tests();
+        FetcherTestConfig {
+            fetcher_config: Default::default(),
+            storage_config,
+            temp_dir,
+        }
+    }
+}
 
-        let (storage_config, _storage_tempdir) = storage::Config::default_for_tests();
-        let storage = Storage::new(WithDir::new(_storage_tempdir.path(), storage_config)).unwrap();
+reactor!(Reactor {
+    type Config = FetcherTestConfig;
 
-        let deploy_acceptor = DeployAcceptor::new();
-        let deploy_fetcher = Fetcher::<Deploy>::new(config);
-
-        let reactor = Reactor {
-            network,
-            storage,
-            deploy_acceptor,
-            deploy_fetcher,
-            _storage_tempdir,
-        };
-
-        let effects = Effects::new();
-
-        Ok((reactor, effects))
+    components: {
+        chainspec_loader = has_effects infallible ChainspecLoader(
+            Chainspec::from_resources("local/chainspec.toml",),
+            effect_builder
+        );
+        network = infallible InMemoryNetwork::<Message>(event_queue, rng);
+        storage = Storage(&WithDir::new(cfg.temp_dir.path(), cfg.storage_config));
+        deploy_acceptor = infallible DeployAcceptor();
+        deploy_fetcher = infallible Fetcher::<Deploy>(cfg.fetcher_config);
     }
 
-    fn dispatch_event(
+    events: {
+        network = Event<Message>;
+        deploy_fetcher = Event<Deploy>;
+    }
+
+    requests: {
+        // This test contains no linear chain requests, so we panic if we receive any.
+        LinearChainRequest<NodeId> -> !;
+        NetworkRequest<NodeId, Message> -> network;
+        StorageRequest -> storage;
+        FetcherRequest<NodeId, Deploy> -> deploy_fetcher;
+
+        // The only contract runtime request will be the commit of genesis, which we discard.
+        ContractRuntimeRequest -> #;
+    }
+
+    announcements: {
+        // The deploy fetcher needs to be notified about new deploys.
+        DeployAcceptorAnnouncement<NodeId> -> [deploy_fetcher];
+        NetworkAnnouncement<NodeId, Message> -> [fn handle_message];
+        // Currently the RpcServerAnnouncement is misnamed - it solely tells of new deploys arriving
+        // from a client.
+        RpcServerAnnouncement -> [deploy_acceptor];
+    }
+});
+
+impl Reactor {
+    fn handle_message(
         &mut self,
-        effect_builder: EffectBuilder<Self::Event>,
-        rng: &mut dyn CryptoRngCore,
-        event: Event,
-    ) -> Effects<Self::Event> {
-        match event {
-            Event::Storage(storage::Event::Request(StorageRequest::GetChainspec {
-                responder,
-                ..
-            })) => responder
-                .respond(Some(Chainspec::from_resources("local/chainspec.toml")))
-                .ignore(),
-            Event::Storage(event) => reactor::wrap_effects(
-                Event::Storage,
-                self.storage.handle_event(effect_builder, rng, event),
-            ),
-            Event::DeployAcceptor(event) => reactor::wrap_effects(
-                Event::DeployAcceptor,
-                self.deploy_acceptor
-                    .handle_event(effect_builder, rng, event),
-            ),
-            Event::DeployFetcher(deploy_event) => reactor::wrap_effects(
-                Event::DeployFetcher,
-                self.deploy_fetcher
-                    .handle_event(effect_builder, rng, deploy_event),
-            ),
-            Event::NetworkRequest(request) => reactor::wrap_effects(
-                Event::NetworkRequest,
-                self.network.handle_event(effect_builder, rng, request),
-            ),
-            Event::DeployFetcherRequest(request) => reactor::wrap_effects(
-                Event::DeployFetcher,
-                self.deploy_fetcher
-                    .handle_event(effect_builder, rng, request.into()),
-            ),
-            Event::NetworkAnnouncement(NetworkAnnouncement::MessageReceived {
-                sender,
-                payload,
-            }) => {
-                let reactor_event = match payload {
-                    Message::GetRequest {
-                        tag: Tag::Deploy,
-                        serialized_id,
-                    } => {
-                        let deploy_hash = match bincode::deserialize(&serialized_id) {
-                            Ok(hash) => hash,
+        effect_builder: EffectBuilder<ReactorEvent>,
+        rng: &mut NodeRng,
+        network_announcement: NetworkAnnouncement<NodeId, Message>,
+    ) -> Effects<ReactorEvent> {
+        // TODO: Make this manual routing disappear and supply appropriate
+        // announcements.
+        match network_announcement {
+            NetworkAnnouncement::MessageReceived { sender, payload } => match payload {
+                Message::GetRequest { serialized_id, .. } => {
+                    let deploy_hash = match bincode::deserialize(&serialized_id) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            error!(
+                                "failed to decode {:?} from {}: {}",
+                                serialized_id, sender, error
+                            );
+                            return Effects::new();
+                        }
+                    };
+
+                    match self
+                        .storage
+                        .handle_legacy_direct_deploy_request(deploy_hash)
+                    {
+                        // This functionality was moved out of the storage component and
+                        // should be refactored ASAP.
+                        Some(deploy) => match Message::new_get_response(&deploy) {
+                            Ok(message) => effect_builder.send_message(sender, message).ignore(),
                             Err(error) => {
-                                error!(
-                                    "failed to decode {:?} from {}: {}",
-                                    serialized_id, sender, error
-                                );
-                                return Effects::new();
+                                error!("failed to create get-response: {}", error);
+                                Effects::new()
                             }
-                        };
-                        Event::Storage(storage::Event::GetDeployForPeer {
-                            deploy_hash,
-                            peer: sender,
-                        })
+                        },
+                        None => {
+                            debug!("failed to get {} for {}", deploy_hash, sender);
+                            Effects::new()
+                        }
                     }
-                    Message::GetResponse {
-                        tag: Tag::Deploy,
-                        serialized_item,
-                    } => {
-                        let deploy = match bincode::deserialize(&serialized_item) {
-                            Ok(deploy) => Box::new(deploy),
-                            Err(error) => {
-                                error!("failed to decode deploy from {}: {}", sender, error);
-                                return Effects::new();
-                            }
-                        };
-                        Event::DeployAcceptor(deploy_acceptor::Event::Accept {
+                }
+
+                Message::GetResponse {
+                    serialized_item, ..
+                } => {
+                    let deploy = match bincode::deserialize(&serialized_item) {
+                        Ok(deploy) => Box::new(deploy),
+                        Err(error) => {
+                            error!("failed to decode deploy from {}: {}", sender, error);
+                            return Effects::new();
+                        }
+                    };
+
+                    self.dispatch_event(
+                        effect_builder,
+                        rng,
+                        ReactorEvent::DeployAcceptor(deploy_acceptor::Event::Accept {
                             deploy,
                             source: Source::Peer(sender),
-                        })
-                    }
-                    msg => panic!("should not get {}", msg),
-                };
-                self.dispatch_event(effect_builder, rng, reactor_event)
-            }
-            Event::NetworkAnnouncement(ann) => {
-                unreachable!("should not receive announcements of type {:?}", ann);
-            }
-            Event::ApiServerAnnouncement(ApiServerAnnouncement::DeployReceived { deploy }) => {
-                let event = deploy_acceptor::Event::Accept {
-                    deploy,
-                    source: Source::<NodeId>::Client,
-                };
-                self.dispatch_event(effect_builder, rng, Event::DeployAcceptor(event))
-            }
-            Event::DeployAcceptorAnnouncement(DeployAcceptorAnnouncement::AcceptedNewDeploy {
-                deploy,
-                source,
-            }) => {
-                let event = super::Event::GotRemotely {
-                    item: deploy,
-                    source,
-                };
-                self.dispatch_event(effect_builder, rng, Event::DeployFetcher(event))
-            }
-            Event::DeployAcceptorAnnouncement(DeployAcceptorAnnouncement::InvalidDeploy {
-                deploy: _,
-                source: _,
-            }) => Effects::new(),
-            Event::LinearChainRequest(_) => panic!("No linear chain requests in the test."),
+                        }),
+                    )
+                }
+                msg => panic!("should not get {}", msg),
+            },
+            ann => panic!("should not received any network announcements: {:?}", ann),
         }
     }
 }
@@ -256,8 +174,10 @@ impl NetworkedReactor for Reactor {
     }
 }
 
-fn announce_deploy_received(deploy: Deploy) -> impl FnOnce(EffectBuilder<Event>) -> Effects<Event> {
-    |effect_builder: EffectBuilder<Event>| {
+fn announce_deploy_received(
+    deploy: Deploy,
+) -> impl FnOnce(EffectBuilder<ReactorEvent>) -> Effects<ReactorEvent> {
+    |effect_builder: EffectBuilder<ReactorEvent>| {
         effect_builder
             .announce_deploy_received(Box::new(deploy))
             .ignore()
@@ -268,8 +188,8 @@ fn fetch_deploy(
     deploy_hash: DeployHash,
     node_id: NodeId,
     fetched: Arc<Mutex<(bool, Option<FetchResult<Deploy>>)>>,
-) -> impl FnOnce(EffectBuilder<Event>) -> Effects<Event> {
-    move |effect_builder: EffectBuilder<Event>| {
+) -> impl FnOnce(EffectBuilder<ReactorEvent>) -> Effects<ReactorEvent> {
+    move |effect_builder: EffectBuilder<ReactorEvent>| {
         effect_builder
             .fetch_deploy(deploy_hash, node_id)
             .then(move |maybe_deploy| async move {
@@ -297,13 +217,13 @@ async fn store_deploy(
         .crank_until(
             node_id,
             &mut rng,
-            move |event: &Event| -> bool {
-                match event {
-                    Event::DeployAcceptorAnnouncement(
+            move |event: &ReactorEvent| {
+                matches!(
+                    event,
+                    ReactorEvent::DeployAcceptorAnnouncement(
                         DeployAcceptorAnnouncement::AcceptedNewDeploy { .. },
-                    ) => true,
-                    _ => false,
-                }
+                    )
+                )
             },
             TIMEOUT,
         )
@@ -332,13 +252,9 @@ async fn assert_settled(
         .reactor()
         .inner()
         .storage
-        .deploy_store()
-        .get(smallvec![deploy_hash])
-        .pop()
-        .expect("should only be a single result")
-        .expect("should not error while getting");
-    assert_eq!(expected_result.is_some(), maybe_stored_deploy.is_some());
+        .get_deploy_by_hash(deploy_hash);
 
+    assert_eq!(expected_result.is_some(), maybe_stored_deploy.is_some());
     assert_eq!(fetched.lock().unwrap().1, expected_result)
 }
 
@@ -368,7 +284,7 @@ async fn should_fetch_from_local() {
     network
         .process_injected_effect_on(
             node_id,
-            fetch_deploy(deploy_hash, *node_id, Arc::clone(&fetched)),
+            fetch_deploy(deploy_hash, node_id.clone(), Arc::clone(&fetched)),
         )
         .await;
 
@@ -414,11 +330,14 @@ async fn should_fetch_from_peer() {
     network
         .process_injected_effect_on(
             node_without_deploy,
-            fetch_deploy(deploy_hash, *node_with_deploy, Arc::clone(&fetched)),
+            fetch_deploy(deploy_hash, node_with_deploy.clone(), Arc::clone(&fetched)),
         )
         .await;
 
-    let expected_result = Some(FetchResult::FromPeer(Box::new(deploy), *node_with_deploy));
+    let expected_result = Some(FetchResult::FromPeer(
+        Box::new(deploy),
+        node_with_deploy.clone(),
+    ));
     assert_settled(
         node_without_deploy,
         deploy_hash,
@@ -449,8 +368,8 @@ async fn should_timeout_fetch_from_peer() {
     let deploy = Deploy::random(&mut rng);
     let deploy_hash = *deploy.id();
 
-    let holding_node = node_ids[0];
-    let requesting_node = node_ids[1];
+    let holding_node = node_ids[0].clone();
+    let requesting_node = node_ids[1].clone();
 
     // Store deploy on holding node.
     store_deploy(&deploy, &holding_node, &mut network, &mut rng).await;
@@ -460,7 +379,7 @@ async fn should_timeout_fetch_from_peer() {
     network
         .process_injected_effect_on(
             &requesting_node,
-            fetch_deploy(deploy_hash, holding_node, Arc::clone(&fetched)),
+            fetch_deploy(deploy_hash, holding_node.clone(), Arc::clone(&fetched)),
         )
         .await;
 
@@ -469,16 +388,14 @@ async fn should_timeout_fetch_from_peer() {
         .crank_until(
             &requesting_node,
             &mut rng,
-            move |event: &Event| -> bool {
-                if let Event::NetworkRequest(NetworkRequest::SendMessage {
-                    payload: Message::GetRequest { .. },
-                    ..
-                }) = event
-                {
-                    true
-                } else {
-                    false
-                }
+            move |event: &ReactorEvent| {
+                matches!(
+                    event,
+                    ReactorEvent::NetworkRequest(NetworkRequest::SendMessage {
+                        payload: Message::GetRequest { .. },
+                        ..
+                    })
+                )
             },
             TIMEOUT,
         )
@@ -489,23 +406,21 @@ async fn should_timeout_fetch_from_peer() {
         .crank_until(
             &holding_node,
             &mut rng,
-            move |event: &Event| -> bool {
-                if let Event::NetworkRequest(NetworkRequest::SendMessage {
-                    payload: Message::GetResponse { .. },
-                    ..
-                }) = event
-                {
-                    true
-                } else {
-                    false
-                }
+            move |event: &ReactorEvent| {
+                matches!(
+                    event,
+                    ReactorEvent::NetworkRequest(NetworkRequest::SendMessage {
+                        payload: Message::GetResponse { .. },
+                        ..
+                    })
+                )
             },
             TIMEOUT,
         )
         .await;
 
     // Advance time.
-    let secs_to_advance = FetcherConfig::default().get_from_peer_timeout();
+    let secs_to_advance = Config::default().get_from_peer_timeout();
     time::pause();
     time::advance(Duration::from_secs(secs_to_advance + 10)).await;
     time::resume();

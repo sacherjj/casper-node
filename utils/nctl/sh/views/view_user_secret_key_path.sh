@@ -1,61 +1,30 @@
 #!/usr/bin/env bash
-#
-# Renders a user secret key path.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifier.
-#   User ordinal identifier.
 
-# Import utils.
-source $NCTL/sh/utils/misc.sh
+source $NCTL/sh/utils.sh
+source $NCTL/sh/views/funcs.sh
 
-#######################################
-# Displays to stdout a user's account key.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifer.
-#   User ordinal identifer.
-#######################################
-function _view_user_secret_key() {
-    declare path_key=$NCTL/assets/net-$1/users/user-$2/secret_key.pem
-    log "secret key :: net-$1:user-$2 -> "$path_key
-}
-
-#######################################
-# Destructure input args.
-#######################################
-
-# Unset to avoid parameter collisions.
-unset net
-unset user
+unset NET_ID
+unset USER_ID
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        net) net=${VALUE} ;;
-        user) user=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        user) USER_ID=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-net=${net:-1}
-user=${user:-"all"}
+NET_ID=${NET_ID:-1}
+USER_ID=${USER_ID:-"all"}
 
-#######################################
-# Main
-#######################################
-
-if [ $user = "all" ]; then
-    source $NCTL/assets/net-$net/vars
-    for user_idx in $(seq 1 $NCTL_NET_USER_COUNT)
+if [ $USER_ID = "all" ]; then
+    for USER_ID in $(seq 1 $(get_count_of_users $NET_ID))
     do
-        _view_user_secret_key $net $user_idx
+        render_account_secret_key $NET_ID $NCTL_ACCOUNT_TYPE_USER $USER_ID
     done
 else
-    _view_user_secret_key $net $user
+    render_account_secret_key $NET_ID $NCTL_ACCOUNT_TYPE_USER $USER_ID
 fi

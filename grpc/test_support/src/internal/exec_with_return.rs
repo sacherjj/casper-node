@@ -12,11 +12,16 @@ use casper_execution_engine::{
         runtime_context::RuntimeContext,
     },
     shared::{gas::Gas, newtypes::CorrelationId, wasm_prep::Preprocessor},
-    storage::{global_state::StateProvider, protocol_data::ProtocolData},
+    storage::{
+        global_state::StateProvider,
+        protocol_data::{ProtocolData, DEFAULT_WASMLESS_TRANSFER_COST},
+    },
 };
 use casper_types::{
-    account::AccountHash, bytesrepr::FromBytes, BlockTime, CLTyped, EntryPointType, Key, Phase,
-    ProtocolVersion, RuntimeArgs, URef, U512,
+    account::AccountHash,
+    bytesrepr::{Bytes, FromBytes},
+    BlockTime, CLTyped, DeployHash, EntryPointType, Key, Phase, ProtocolVersion, RuntimeArgs, URef,
+    U512,
 };
 
 use crate::internal::{utils, WasmTestBuilder, DEFAULT_WASM_CONFIG};
@@ -32,7 +37,7 @@ pub fn exec<S, T>(
     address: AccountHash,
     wasm_file: &str,
     block_time: u64,
-    deploy_hash: [u8; 32],
+    deploy_hash: DeployHash,
     entry_point_name: &str,
     args: RuntimeArgs,
     extra_urefs: Vec<URef>,
@@ -58,16 +63,16 @@ where
 
     let phase = Phase::Session;
     let address_generator = {
-        let address_generator = AddressGenerator::new(&deploy_hash, phase);
+        let address_generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
         Rc::new(RefCell::new(address_generator))
     };
     let transfer_address_generator = {
-        let address_generator = AddressGenerator::new(&deploy_hash, phase);
+        let address_generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
         Rc::new(RefCell::new(address_generator))
     };
     let gas_counter = Gas::default();
     let fn_store_id = {
-        let fn_store_id = AddressGenerator::new(&deploy_hash, phase);
+        let fn_store_id = AddressGenerator::new(deploy_hash.as_bytes(), phase);
         Rc::new(RefCell::new(fn_store_id))
     };
     let gas_limit = Gas::new(U512::from(std::u64::MAX));
@@ -91,7 +96,14 @@ where
         let pos = builder.get_mint_contract_hash();
         let standard_payment = builder.get_standard_payment_contract_hash();
         let auction = builder.get_auction_contract_hash();
-        ProtocolData::new(*DEFAULT_WASM_CONFIG, mint, pos, standard_payment, auction)
+        ProtocolData::new(
+            *DEFAULT_WASM_CONFIG,
+            mint,
+            pos,
+            standard_payment,
+            auction,
+            DEFAULT_WASMLESS_TRANSFER_COST,
+        )
     };
 
     let transfers = Vec::default();
@@ -121,8 +133,8 @@ where
 
     let wasm_bytes = utils::read_wasm_file_bytes(wasm_file);
     let deploy_item = ExecutableDeployItem::ModuleBytes {
-        module_bytes: wasm_bytes,
-        args: Vec::new(),
+        module_bytes: wasm_bytes.into(),
+        args: Bytes::new(),
     };
 
     let wasm_config = *DEFAULT_WASM_CONFIG;
@@ -140,9 +152,12 @@ where
         )
         .expect("should get wasm module");
 
-    let (instance, memory) =
-        runtime::instance_and_memory(parity_module.clone().take_module(), protocol_version)
-            .expect("should be able to make wasm instance from module");
+    let (instance, memory) = runtime::instance_and_memory(
+        parity_module.clone().take_module(),
+        protocol_version,
+        &wasm_config,
+    )
+    .expect("should be able to make wasm instance from module");
 
     let mut runtime = Runtime::new(
         config,

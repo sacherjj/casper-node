@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::{crate_version, App, Arg};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 
 pub mod common;
 mod contract_package;
@@ -20,7 +20,7 @@ const APP_NAME: &str = "cargo-casper";
 const ABOUT: &str =
     "A command line tool for creating a Wasm contract and tests at <path> for use on the \
      Casper Platform.";
-const TOOLCHAIN: &str = "nightly-2020-07-05";
+const TOOLCHAIN: &str = "nightly-2020-11-10";
 
 const ROOT_PATH_ARG_NAME: &str = "path";
 const ROOT_PATH_ARG_VALUE_NAME: &str = "path";
@@ -37,17 +37,17 @@ const WORKSPACE_PATH_ARG_LONG: &str = "workspace-path";
 
 const FAILURE_EXIT_CODE: i32 = 101;
 
-lazy_static! {
-    static ref USAGE: String = format!(
+static USAGE: Lazy<String> = Lazy::new(|| {
+    format!(
         r#"cargo casper [FLAGS] <path>
     rustup install {0}
     rustup target add --toolchain {0} wasm32-unknown-unknown
     cd <path>/tests
     cargo test"#,
         TOOLCHAIN
-    );
-    static ref ARGS: Args = Args::new();
-}
+    )
+});
+static ARGS: Lazy<Args> = Lazy::new(Args::new);
 
 #[derive(Debug)]
 struct Args {

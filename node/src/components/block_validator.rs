@@ -25,9 +25,12 @@ use crate::{
         requests::{BlockValidationRequest, FetcherRequest},
         EffectBuilder, EffectExt, EffectOptionExt, Effects, Responder,
     },
-    types::{BlockLike, CryptoRngCore, Deploy, DeployHash},
+    types::{BlockLike, Deploy, DeployHash},
+    NodeRng,
 };
 use keyed_counter::KeyedCounter;
+
+use super::fetcher::FetchResult;
 
 /// Block validator component event.
 #[derive(Debug, From, Display)]
@@ -94,7 +97,7 @@ where
     fn handle_event(
         &mut self,
         effect_builder: EffectBuilder<REv>,
-        _rng: &mut dyn CryptoRngCore,
+        _rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         match event {
@@ -102,6 +105,7 @@ where
                 block,
                 sender,
                 responder,
+                block_timestamp,
             }) => {
                 if block.deploys().is_empty() {
                     // If there are no deploys, return early.
@@ -117,15 +121,24 @@ where
                     .iter()
                     .flat_map(|deploy_hash| {
                         // For every request, increase the number of in-flight...
-                        self.in_flight.inc(deploy_hash);
+                        self.in_flight.inc(*deploy_hash);
 
                         // ...then request it.
-                        let dh_found = *deploy_hash;
-                        let dh_not_found = *deploy_hash;
+                        let dh_found = **deploy_hash;
+                        let dh_not_found = **deploy_hash;
                         effect_builder
-                            .fetch_deploy(*deploy_hash, sender.clone())
-                            .option(
-                                move |_value| Event::DeployFound(dh_found),
+                            .fetch_deploy(**deploy_hash, sender.clone())
+                            .map_or_else(
+                                move |result: FetchResult<Deploy>| match result {
+                                    FetchResult::FromStorage(deploy)
+                                    | FetchResult::FromPeer(deploy, _) => {
+                                        if deploy.header().timestamp() > block_timestamp {
+                                            Event::DeployMissing(dh_found)
+                                        } else {
+                                            Event::DeployFound(dh_found)
+                                        }
+                                    }
+                                },
                                 move || Event::DeployMissing(dh_not_found),
                             )
                     })
@@ -142,7 +155,7 @@ where
                     Entry::Vacant(entry) => {
                         // Our entry is vacant - create an entry to track the state.
                         let missing_deploys: HashSet<DeployHash> =
-                            entry.key().deploys().iter().cloned().collect();
+                            entry.key().deploys().iter().map(|hash| **hash).collect();
 
                         entry.insert(BlockValidationState {
                             missing_deploys,

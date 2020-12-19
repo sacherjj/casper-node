@@ -24,7 +24,6 @@
     arithmetic_overflow,
     invalid_type_param_default,
     macro_expanded_macro_exports_accessed_by_absolute_paths,
-    missing_fragment_specifier,
     mutable_transmutes,
     no_mangle_const_items,
     order_dependent_trait_objects,
@@ -45,7 +44,7 @@ use std::{
 };
 
 use clap::{crate_version, App, Arg};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 
 use package::Package;
 
@@ -72,6 +71,9 @@ const DRY_RUN_ARG_NAME: &str = "dry-run";
 const DRY_RUN_ARG_SHORT: &str = "d";
 const DRY_RUN_ARG_HELP: &str = "Check all regexes get matches in current casper-node repo";
 
+const ALLOW_EARLIER_VERSION_NAME: &str = "allow-earlier-version";
+const ALLOW_EARLIER_VERSION_HELP: &str = "Allow manual setting of version earlier than current";
+
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) enum BumpVersion {
     Major,
@@ -83,6 +85,7 @@ struct Args {
     root_dir: PathBuf,
     bump_version: Option<BumpVersion>,
     dry_run: bool,
+    allow_earlier_version: bool,
 }
 
 /// The full path to the casper-node root directory.
@@ -100,9 +103,12 @@ pub(crate) fn is_dry_run() -> bool {
     ARGS.dry_run
 }
 
-lazy_static! {
-    static ref ARGS: Args = get_args();
+/// If we allow reverting version to previous (used for master back to previous release branch)
+pub(crate) fn allow_earlier_version() -> bool {
+    ARGS.allow_earlier_version
 }
+
+static ARGS: Lazy<Args> = Lazy::new(get_args);
 
 fn get_args() -> Args {
     let arg_matches = App::new(APP_NAME)
@@ -130,6 +136,11 @@ fn get_args() -> Args {
                 .short(DRY_RUN_ARG_SHORT)
                 .help(DRY_RUN_ARG_HELP),
         )
+        .arg(
+            Arg::with_name(ALLOW_EARLIER_VERSION_NAME)
+                .long(ALLOW_EARLIER_VERSION_NAME)
+                .help(ALLOW_EARLIER_VERSION_HELP),
+        )
         .get_matches();
 
     let root_dir = match arg_matches.value_of(ROOT_DIR_ARG_NAME) {
@@ -154,10 +165,13 @@ fn get_args() -> Args {
 
     let dry_run = arg_matches.is_present(DRY_RUN_ARG_NAME);
 
+    let allow_earlier_version = arg_matches.is_present(ALLOW_EARLIER_VERSION_NAME);
+
     Args {
         root_dir,
         bump_version,
         dry_run,
+        allow_earlier_version,
     }
 }
 
@@ -170,6 +184,9 @@ fn main() {
         &*regex_data::execution_engine::DEPENDENT_FILES,
     );
     execution_engine.update();
+
+    let node_macros = Package::cargo("node_macros", &*regex_data::node_macros::DEPENDENT_FILES);
+    node_macros.update();
 
     let node = Package::cargo("node", &*regex_data::node::DEPENDENT_FILES);
     node.update();
@@ -204,12 +221,14 @@ fn main() {
     );
     grpc_cargo_casper.update();
 
-    // Update Cargo.lock.
-    let status = Command::new(env!("CARGO"))
-        .arg("generate-lockfile")
-        .arg("--offline")
-        .current_dir(root_dir())
-        .status()
-        .expect("Failed to execute 'cargo generate-lockfile'");
-    assert!(status.success(), "Failed to update Cargo.lock");
+    // Update Cargo.lock if this isn't a dry run.
+    if !is_dry_run() {
+        let status = Command::new(env!("CARGO"))
+            .arg("generate-lockfile")
+            .arg("--offline")
+            .current_dir(root_dir())
+            .status()
+            .expect("Failed to execute 'cargo generate-lockfile'");
+        assert!(status.success(), "Failed to update Cargo.lock");
+    }
 }

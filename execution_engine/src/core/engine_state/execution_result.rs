@@ -43,7 +43,7 @@ fn make_payment_error_effects(
     ExecutionEffect::new(ops, transforms)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ExecutionResult {
     /// An error condition that happened during execution
     Failure {
@@ -281,6 +281,33 @@ impl ExecutionResult {
     }
 }
 
+impl From<&ExecutionResult> for casper_types::ExecutionResult {
+    fn from(ee_execution_result: &ExecutionResult) -> Self {
+        match ee_execution_result {
+            ExecutionResult::Success {
+                effect,
+                transfers,
+                cost,
+            } => casper_types::ExecutionResult::Success {
+                effect: effect.into(),
+                transfers: transfers.clone(),
+                cost: cost.value(),
+            },
+            ExecutionResult::Failure {
+                error,
+                effect,
+                transfers,
+                cost,
+            } => casper_types::ExecutionResult::Failure {
+                effect: effect.into(),
+                transfers: transfers.clone(),
+                cost: cost.value(),
+                error_message: error.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ExecutionResultBuilderError {
     MissingPaymentExecutionResult,
@@ -345,7 +372,7 @@ impl ExecutionResultBuilder {
     }
 
     pub fn transfers(&self) -> Vec<TransferAddr> {
-        self.payment_execution_result
+        self.session_execution_result
             .as_ref()
             .map(ExecutionResult::transfers)
             .cloned()

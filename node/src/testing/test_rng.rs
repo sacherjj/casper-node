@@ -108,10 +108,7 @@ impl Debug for TestRng {
 impl Drop for TestRng {
     fn drop(&mut self) {
         if thread::panicking() {
-            let line_1 = format!(
-                "Thread: {}",
-                thread::current().name().unwrap_or_else(|| "unnamed")
-            );
+            let line_1 = format!("Thread: {}", thread::current().name().unwrap_or("unnamed"));
             let line_2 = "To reproduce failure, try running with env var:";
             let line_3 = format!("{}={}", CL_TEST_SEED, HexFmt(&self.seed));
             let max_length = cmp::max(line_1.len(), line_2.len());
@@ -121,6 +118,14 @@ impl Drop for TestRng {
                 border, line_1, line_2, line_3, border
             );
         }
+    }
+}
+
+impl SeedableRng for TestRng {
+    type Seed = <Pcg64Mcg as SeedableRng>::Seed;
+
+    fn from_seed(seed: Self::Seed) -> Self {
+        Self::from_seed(seed)
     }
 }
 

@@ -1,3 +1,6 @@
+// TODO - remove once schemars stops causing warning.
+#![allow(clippy::field_reassign_with_default)]
+
 use alloc::{format, string::String, vec::Vec};
 use core::{
     array::TryFromSliceError,
@@ -7,8 +10,15 @@ use core::{
 };
 
 use hex_fmt::HexFmt;
+#[cfg(feature = "std")]
+use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
+use serde::{de::Error as SerdeError, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{bytesrepr, AccessRights, ApiError, Key, ACCESS_RIGHTS_SERIALIZED_LENGTH};
+use crate::{
+    bytesrepr,
+    bytesrepr::{Error, FromBytes},
+    AccessRights, ApiError, Key, ACCESS_RIGHTS_SERIALIZED_LENGTH,
+};
 
 /// The number of bytes in a [`URef`] address.
 pub const UREF_ADDR_LENGTH: usize = 32;
@@ -18,7 +28,7 @@ pub const UREF_SERIALIZED_LENGTH: usize = UREF_ADDR_LENGTH + ACCESS_RIGHTS_SERIA
 
 const FORMATTED_STRING_PREFIX: &str = "uref-";
 
-/// The address of a [`URef`](types::URef) (unforgeable reference) on the network.
+/// The address of a `URef` (unforgeable reference) on the network.
 pub type URefAddr = [u8; UREF_ADDR_LENGTH];
 
 /// Error while parsing a URef from a formatted string.
@@ -56,6 +66,23 @@ impl From<TryFromSliceError> for FromStrError {
     }
 }
 
+impl Display for FromStrError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            FromStrError::InvalidPrefix => write!(f, "prefix is not 'uref-'"),
+            FromStrError::MissingSuffix => write!(f, "no access rights as suffix"),
+            FromStrError::InvalidAccessRights => write!(f, "invalid access rights"),
+            FromStrError::Hex(error) => {
+                write!(f, "failed to decode address portion from hex: {}", error)
+            }
+            FromStrError::Int(error) => write!(f, "failed to parse an int: {}", error),
+            FromStrError::Address(error) => {
+                write!(f, "address portion is the wrong length: {}", error)
+            }
+        }
+    }
+}
+
 /// Represents an unforgeable reference, containing an address in the network's global storage and
 /// the [`AccessRights`] of the reference.
 ///
@@ -65,7 +92,7 @@ pub struct URef(URefAddr, AccessRights);
 
 impl URef {
     /// Constructs a [`URef`] from an address and access rights.
-    pub fn new(address: URefAddr, access_rights: AccessRights) -> Self {
+    pub const fn new(address: URefAddr, access_rights: AccessRights) -> Self {
         URef(address, access_rights)
     }
 
@@ -137,7 +164,7 @@ impl URef {
     pub fn from_formatted_str(input: &str) -> Result<Self, FromStrError> {
         let remainder = input
             .strip_prefix(FORMATTED_STRING_PREFIX)
-            .ok_or_else(|| FromStrError::InvalidPrefix)?;
+            .ok_or(FromStrError::InvalidPrefix)?;
         let parts = remainder.splitn(2, '-').collect::<Vec<_>>();
         if parts.len() != 2 {
             return Err(FromStrError::MissingSuffix);
@@ -145,8 +172,22 @@ impl URef {
         let addr = URefAddr::try_from(base16::decode(parts[0])?.as_ref())?;
         let access_rights_value = u8::from_str_radix(parts[1], 8)?;
         let access_rights = AccessRights::from_bits(access_rights_value)
-            .ok_or_else(|| FromStrError::InvalidAccessRights)?;
+            .ok_or(FromStrError::InvalidAccessRights)?;
         Ok(URef(addr, access_rights))
+    }
+}
+
+#[cfg(feature = "std")]
+impl JsonSchema for URef {
+    fn schema_name() -> String {
+        String::from("URef")
+    }
+
+    fn json_schema(gen: &mut SchemaGenerator) -> Schema {
+        let schema = gen.subschema_for::<String>();
+        let mut schema_object = schema.into_object();
+        schema_object.metadata().description = Some("Hex-encoded, formatted URef.".to_string());
+        schema_object.into()
     }
 }
 
@@ -165,7 +206,7 @@ impl Debug for URef {
 }
 
 impl bytesrepr::ToBytes for URef {
-    fn to_bytes(&self) -> Result<Vec<u8>, bytesrepr::Error> {
+    fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut result = bytesrepr::unchecked_allocate_buffer(self);
         result.append(&mut self.0.to_bytes()?);
         result.append(&mut self.1.to_bytes()?);
@@ -177,11 +218,33 @@ impl bytesrepr::ToBytes for URef {
     }
 }
 
-impl bytesrepr::FromBytes for URef {
-    fn from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), bytesrepr::Error> {
-        let (id, rem): ([u8; 32], &[u8]) = bytesrepr::FromBytes::from_bytes(bytes)?;
-        let (access_rights, rem): (AccessRights, &[u8]) = bytesrepr::FromBytes::from_bytes(rem)?;
+impl FromBytes for URef {
+    fn from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let (id, rem) = FromBytes::from_bytes(bytes)?;
+        let (access_rights, rem) = FromBytes::from_bytes(rem)?;
         Ok((URef(id, access_rights), rem))
+    }
+}
+
+impl Serialize for URef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            self.to_formatted_string().serialize(serializer)
+        } else {
+            (self.0, self.1).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for URef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let formatted_string = String::deserialize(deserializer)?;
+            URef::from_formatted_str(&formatted_string).map_err(D::Error::custom)
+        } else {
+            let (address, access_rights) = <(URefAddr, AccessRights)>::deserialize(deserializer)?;
+            Ok(URef(address, access_rights))
+        }
     }
 }
 
@@ -266,5 +329,21 @@ mod tests {
         let invalid_access_rights =
             "uref-0000000000000000000000000000000000000000000000000000000000000000-200";
         assert!(URef::from_formatted_str(invalid_access_rights).is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let uref = URef::new([255; 32], AccessRights::READ_ADD_WRITE);
+        let serialized = bincode::serialize(&uref).unwrap();
+        let decoded = bincode::deserialize(&serialized).unwrap();
+        assert_eq!(uref, decoded);
+    }
+
+    #[test]
+    fn json_roundtrip() {
+        let uref = URef::new([255; 32], AccessRights::READ_ADD_WRITE);
+        let json_string = serde_json::to_string_pretty(&uref).unwrap();
+        let decoded = serde_json::from_str(&json_string).unwrap();
+        assert_eq!(uref, decoded);
     }
 }

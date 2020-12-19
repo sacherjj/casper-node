@@ -1,9 +1,10 @@
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 
 use casper_engine_test_support::{
     internal::{
-        utils, InMemoryWasmTestBuilder, AUCTION_INSTALL_CONTRACT, DEFAULT_VALIDATOR_SLOTS,
-        DEFAULT_WASM_CONFIG, MINT_INSTALL_CONTRACT, POS_INSTALL_CONTRACT,
+        utils, InMemoryWasmTestBuilder, AUCTION_INSTALL_CONTRACT, DEFAULT_AUCTION_DELAY,
+        DEFAULT_LOCKED_FUNDS_PERIOD, DEFAULT_ROUND_SEIGNIORAGE_RATE, DEFAULT_UNBONDING_DELAY,
+        DEFAULT_VALIDATOR_SLOTS, DEFAULT_WASM_CONFIG, MINT_INSTALL_CONTRACT, POS_INSTALL_CONTRACT,
         STANDARD_PAYMENT_INSTALL_CONTRACT,
     },
     AccountHash,
@@ -15,6 +16,7 @@ use casper_execution_engine::{
         SYSTEM_ACCOUNT_ADDR,
     },
     shared::{motes::Motes, stored_value::StoredValue},
+    storage::protocol_data::DEFAULT_WASMLESS_TRANSFER_COST,
 };
 use casper_types::{mint::TOTAL_SUPPLY_KEY, ProtocolVersion, PublicKey, U512};
 
@@ -31,31 +33,29 @@ const ACCOUNT_1_ADDR: AccountHash = AccountHash::new([43; 32]);
 const ACCOUNT_2_PUBLIC_KEY: PublicKey = PublicKey::Ed25519([44; 32]);
 const ACCOUNT_2_ADDR: AccountHash = AccountHash::new([45; 32]);
 
-lazy_static! {
-    static ref GENESIS_CUSTOM_ACCOUNTS: Vec<GenesisAccount> = {
-        let account_1 = {
-            let account_1_balance = Motes::new(ACCOUNT_1_BALANCE.into());
-            let account_1_bonded_amount = Motes::new(ACCOUNT_1_BONDED_AMOUNT.into());
-            GenesisAccount::new(
-                ACCOUNT_1_PUBLIC_KEY,
-                ACCOUNT_1_ADDR,
-                account_1_balance,
-                account_1_bonded_amount,
-            )
-        };
-        let account_2 = {
-            let account_2_balance = Motes::new(ACCOUNT_2_BALANCE.into());
-            let account_2_bonded_amount = Motes::new(ACCOUNT_2_BONDED_AMOUNT.into());
-            GenesisAccount::new(
-                ACCOUNT_2_PUBLIC_KEY,
-                ACCOUNT_2_ADDR,
-                account_2_balance,
-                account_2_bonded_amount,
-            )
-        };
-        vec![account_1, account_2]
+static GENESIS_CUSTOM_ACCOUNTS: Lazy<Vec<GenesisAccount>> = Lazy::new(|| {
+    let account_1 = {
+        let account_1_balance = Motes::new(ACCOUNT_1_BALANCE.into());
+        let account_1_bonded_amount = Motes::new(ACCOUNT_1_BONDED_AMOUNT.into());
+        GenesisAccount::new(
+            ACCOUNT_1_PUBLIC_KEY,
+            ACCOUNT_1_ADDR,
+            account_1_balance,
+            account_1_bonded_amount,
+        )
     };
-}
+    let account_2 = {
+        let account_2_balance = Motes::new(ACCOUNT_2_BALANCE.into());
+        let account_2_bonded_amount = Motes::new(ACCOUNT_2_BONDED_AMOUNT.into());
+        GenesisAccount::new(
+            ACCOUNT_2_PUBLIC_KEY,
+            ACCOUNT_2_ADDR,
+            account_2_balance,
+            account_2_bonded_amount,
+        )
+    };
+    vec![account_1, account_2]
+});
 
 #[ignore]
 #[test]
@@ -68,6 +68,11 @@ fn should_run_genesis() {
     let protocol_version = ProtocolVersion::V1_0_0;
     let wasm_config = *DEFAULT_WASM_CONFIG;
     let validator_slots = DEFAULT_VALIDATOR_SLOTS;
+    let auction_delay = DEFAULT_AUCTION_DELAY;
+    let locked_funds_period = DEFAULT_LOCKED_FUNDS_PERIOD;
+    let round_seigniorage_rate = DEFAULT_ROUND_SEIGNIORAGE_RATE;
+    let unbonding_delay = DEFAULT_UNBONDING_DELAY;
+    let wasmless_transfer_cost = DEFAULT_WASMLESS_TRANSFER_COST;
 
     let exec_config = ExecConfig::new(
         mint_installer_bytes,
@@ -77,6 +82,11 @@ fn should_run_genesis() {
         GENESIS_CUSTOM_ACCOUNTS.clone(),
         wasm_config,
         validator_slots,
+        auction_delay,
+        locked_funds_period,
+        round_seigniorage_rate,
+        unbonding_delay,
+        wasmless_transfer_cost,
     );
     let run_genesis_request =
         RunGenesisRequest::new(GENESIS_CONFIG_HASH.into(), protocol_version, exec_config);
@@ -134,7 +144,11 @@ fn should_track_total_token_supply_in_mint() {
     let wasm_config = *DEFAULT_WASM_CONFIG;
     let protocol_version = ProtocolVersion::V1_0_0;
     let validator_slots = DEFAULT_VALIDATOR_SLOTS;
-
+    let auction_delay = DEFAULT_AUCTION_DELAY;
+    let locked_funds_period = DEFAULT_LOCKED_FUNDS_PERIOD;
+    let round_seigniorage_rate = DEFAULT_ROUND_SEIGNIORAGE_RATE;
+    let unbonding_delay = DEFAULT_UNBONDING_DELAY;
+    let wasmless_transfer_cost = DEFAULT_WASMLESS_TRANSFER_COST;
     let ee_config = ExecConfig::new(
         mint_installer_bytes,
         proof_of_stake_installer_bytes,
@@ -143,6 +157,11 @@ fn should_track_total_token_supply_in_mint() {
         accounts.clone(),
         wasm_config,
         validator_slots,
+        auction_delay,
+        locked_funds_period,
+        round_seigniorage_rate,
+        unbonding_delay,
+        wasmless_transfer_cost,
     );
     let run_genesis_request =
         RunGenesisRequest::new(GENESIS_CONFIG_HASH.into(), protocol_version, ee_config);
@@ -188,6 +207,11 @@ fn should_fail_if_bad_mint_install_contract_is_provided() {
         let protocol_version = ProtocolVersion::V1_0_0;
         let wasm_config = *DEFAULT_WASM_CONFIG;
         let validator_slots = DEFAULT_VALIDATOR_SLOTS;
+        let auction_delay = DEFAULT_AUCTION_DELAY;
+        let locked_funds_period = DEFAULT_LOCKED_FUNDS_PERIOD;
+        let round_seigniorage_rate = DEFAULT_ROUND_SEIGNIORAGE_RATE;
+        let unbonding_delay = DEFAULT_UNBONDING_DELAY;
+        let wasmless_transfer_cost = DEFAULT_WASMLESS_TRANSFER_COST;
 
         let exec_config = ExecConfig::new(
             mint_installer_bytes,
@@ -197,6 +221,11 @@ fn should_fail_if_bad_mint_install_contract_is_provided() {
             GENESIS_CUSTOM_ACCOUNTS.clone(),
             wasm_config,
             validator_slots,
+            auction_delay,
+            locked_funds_period,
+            round_seigniorage_rate,
+            unbonding_delay,
+            wasmless_transfer_cost,
         );
         RunGenesisRequest::new(GENESIS_CONFIG_HASH.into(), protocol_version, exec_config)
     };
@@ -220,6 +249,12 @@ fn should_fail_if_bad_pos_install_contract_is_provided() {
         let protocol_version = ProtocolVersion::V1_0_0;
         let wasm_config = *DEFAULT_WASM_CONFIG;
         let validator_slots = DEFAULT_VALIDATOR_SLOTS;
+        let auction_delay = DEFAULT_AUCTION_DELAY;
+        let locked_funds_period = DEFAULT_LOCKED_FUNDS_PERIOD;
+        let round_seigniorage_rate = DEFAULT_ROUND_SEIGNIORAGE_RATE;
+        let unbonding_delay = DEFAULT_UNBONDING_DELAY;
+        let wasmless_transfer_cost = DEFAULT_WASMLESS_TRANSFER_COST;
+
         let exec_config = ExecConfig::new(
             mint_installer_bytes,
             pos_installer_bytes,
@@ -228,6 +263,11 @@ fn should_fail_if_bad_pos_install_contract_is_provided() {
             GENESIS_CUSTOM_ACCOUNTS.clone(),
             wasm_config,
             validator_slots,
+            auction_delay,
+            locked_funds_period,
+            round_seigniorage_rate,
+            unbonding_delay,
+            wasmless_transfer_cost,
         );
         RunGenesisRequest::new(GENESIS_CONFIG_HASH.into(), protocol_version, exec_config)
     };

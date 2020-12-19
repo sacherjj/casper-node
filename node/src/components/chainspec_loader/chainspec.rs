@@ -7,24 +7,28 @@ use std::{
 
 use csv::ReaderBuilder;
 use datasize::DataSize;
+use num::rational::Ratio;
 use num_traits::Zero;
 #[cfg(test)]
 use rand::Rng;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
 use casper_execution_engine::{
     core::engine_state::genesis::{ExecConfig, GenesisAccount},
     shared::{motes::Motes, wasm_config::WasmConfig},
 };
-use casper_types::U512;
+use casper_types::{auction::EraId, U512};
 
 use super::{config, error::GenesisLoadError, Error};
 #[cfg(test)]
 use crate::testing::TestRng;
 use crate::{
-    crypto::asymmetric_key::PublicKey,
+    crypto::{
+        asymmetric_key::PublicKey,
+        hash::{self, Digest},
+    },
     types::{TimeDiff, Timestamp},
     utils::Loadable,
 };
@@ -38,6 +42,7 @@ pub struct DeployConfig {
     pub(crate) max_dependencies: u8,
     pub(crate) max_block_size: u32,
     pub(crate) block_max_deploy_count: u32,
+    pub(crate) block_max_transfer_count: u32,
     pub(crate) block_gas_limit: u64,
 }
 
@@ -49,6 +54,7 @@ impl Default for DeployConfig {
             max_dependencies: 10,
             max_block_size: 10_485_760,
             block_max_deploy_count: 10,
+            block_max_transfer_count: 1000,
             block_gas_limit: 10_000_000_000_000,
         }
     }
@@ -65,6 +71,7 @@ impl DeployConfig {
         let max_dependencies = rng.gen();
         let max_block_size = rng.gen_range(1_000_000, 1_000_000_000);
         let block_max_deploy_count = rng.gen();
+        let block_max_transfer_count = rng.gen();
         let block_gas_limit = rng.gen_range(100_000_000_000, 1_000_000_000_000_000);
 
         DeployConfig {
@@ -73,6 +80,7 @@ impl DeployConfig {
             max_dependencies,
             max_block_size,
             block_max_deploy_count,
+            block_max_transfer_count,
             block_gas_limit,
         }
     }
@@ -84,30 +92,27 @@ impl DeployConfig {
 pub(crate) struct HighwayConfig {
     // TODO: Most of these are not Highway-specific.
     // TODO: Some should be defined on-chain in a contract instead, or be part of `UpgradePoint`.
-    pub(crate) genesis_era_start_timestamp: Timestamp,
     pub(crate) era_duration: TimeDiff,
     pub(crate) minimum_era_height: u64,
-    // TODO: This is duplicated (and probably in conflict with) `AUCTION_DELAY`.
-    pub(crate) booking_duration: TimeDiff,
-    pub(crate) entropy_duration: TimeDiff,
-    // TODO: Do we need this? When we see the switch block finalized it should suffice to keep
-    // gossiping, without producing new votes. Everyone else will eventually see the same finality.
-    pub(crate) voting_period_duration: TimeDiff,
-    pub(crate) finality_threshold_percent: u8,
+    #[data_size(skip)]
+    pub(crate) finality_threshold_fraction: Ratio<u64>,
     pub(crate) minimum_round_exponent: u8,
+    pub(crate) maximum_round_exponent: u8,
+    /// The factor by which rewards for a round are multiplied if the greatest summit has ≤50%
+    /// quorum, i.e. no finality.
+    #[data_size(skip)]
+    pub(crate) reduced_reward_multiplier: Ratio<u64>,
 }
 
 impl Default for HighwayConfig {
     fn default() -> Self {
         HighwayConfig {
-            genesis_era_start_timestamp: Timestamp::from_str("2020-10-01T00:00:01.000Z").unwrap(),
             era_duration: TimeDiff::from_str("1week").unwrap(),
             minimum_era_height: 100,
-            booking_duration: TimeDiff::from_str("10days").unwrap(),
-            entropy_duration: TimeDiff::from_str("3hours").unwrap(),
-            voting_period_duration: TimeDiff::from_str("2days").unwrap(),
-            finality_threshold_percent: 10,
+            finality_threshold_fraction: Ratio::new(1, 3),
             minimum_round_exponent: 14, // 2**14 ms = ~16 seconds
+            maximum_round_exponent: 19, // 2**19 ms = ~8.7 minutes
+            reduced_reward_multiplier: Ratio::new(1, 5),
         }
     }
 }
@@ -123,6 +128,32 @@ impl HighwayConfig {
         {
             warn!("Era duration is less than minimum era height * round length!");
         }
+
+        if self.minimum_round_exponent > self.maximum_round_exponent {
+            panic!(
+                "Minimum round exponent is greater than the maximum round exponent.\n\
+                 Minimum round exponent: {min},\n\
+                 Maximum round exponent: {max}",
+                min = self.minimum_round_exponent,
+                max = self.maximum_round_exponent
+            );
+        }
+
+        if self.finality_threshold_fraction <= Ratio::new(0, 1)
+            || self.finality_threshold_fraction >= Ratio::new(1, 1)
+        {
+            panic!(
+                "Finality threshold fraction is not in the range (0, 1)! Finality threshold: {ftt}",
+                ftt = self.finality_threshold_fraction
+            );
+        }
+
+        if self.reduced_reward_multiplier > Ratio::new(1, 1) {
+            panic!(
+                "Reduced reward multiplier is not in the range [0, 1]! Multiplier: {rrm}",
+                rrm = self.reduced_reward_multiplier
+            );
+        }
     }
 }
 
@@ -131,14 +162,12 @@ impl HighwayConfig {
     /// Generates a random instance using a `TestRng`.
     pub fn random(rng: &mut TestRng) -> Self {
         HighwayConfig {
-            genesis_era_start_timestamp: Timestamp::random(rng),
             era_duration: TimeDiff::from(rng.gen_range(600_000, 604_800_000)),
             minimum_era_height: rng.gen_range(5, 100),
-            booking_duration: TimeDiff::from(rng.gen_range(600_000, 864_000_000)),
-            entropy_duration: TimeDiff::from(rng.gen_range(600_000, 10_800_000)),
-            voting_period_duration: TimeDiff::from(rng.gen_range(600_000, 172_800_000)),
-            finality_threshold_percent: rng.gen_range(0, 101),
-            minimum_round_exponent: rng.gen_range(0, 20),
+            finality_threshold_fraction: Ratio::new(rng.gen_range(1, 100), 100),
+            minimum_round_exponent: rng.gen_range(0, 16),
+            maximum_round_exponent: rng.gen_range(16, 22),
+            reduced_reward_multiplier: Ratio::new(rng.gen_range(0, 10), 10),
         }
     }
 }
@@ -180,6 +209,21 @@ pub struct GenesisConfig {
     pub(crate) name: String,
     pub(crate) timestamp: Timestamp,
     pub(crate) validator_slots: u32,
+    /// Number of eras before an auction actually defines the set of validators.
+    /// If you bond with a sufficient bid in era N, you will be a validator in era N +
+    /// auction_delay + 1
+    pub(crate) auction_delay: u64,
+    /// The delay for the payout of funds, in eras. If a withdraw request is included in a block in
+    /// era N (other than the last one), they are paid out in the last block of era N +
+    /// locked_funds_period.
+    pub(crate) locked_funds_period: EraId,
+    /// Round seigniorage rate represented as a fractional number.
+    #[data_size(skip)]
+    pub(crate) round_seigniorage_rate: Ratio<u64>,
+    /// The delay for paying out the the unbonding amount.
+    pub(crate) unbonding_delay: EraId,
+    /// Wasmless transfer cost expressed in gas.
+    pub(crate) wasmless_transfer_cost: u64,
     // We don't have an implementation for the semver version type, we skip it for now
     #[data_size(skip)]
     pub(crate) protocol_version: Version,
@@ -213,7 +257,6 @@ impl GenesisConfig {
                     None
                 }
             })
-            .clone()
             .collect()
     }
 
@@ -260,6 +303,12 @@ impl GenesisConfig {
         let name = rng.gen::<char>().to_string();
         let timestamp = Timestamp::random(rng);
         let validator_slots = rng.gen::<u32>();
+        let auction_delay = rng.gen::<u64>();
+        let locked_funds_period: EraId = rng.gen::<u64>();
+        let round_seigniorage_rate = Ratio::new(
+            rng.gen_range(1, 1_000_000_000),
+            rng.gen_range(1, 1_000_000_000),
+        );
         let protocol_version = Version::new(
             rng.gen_range(0, 10),
             rng.gen::<u8>() as u64,
@@ -273,11 +322,18 @@ impl GenesisConfig {
         let costs = rng.gen();
         let deploy_config = DeployConfig::random(rng);
         let highway_config = HighwayConfig::random(rng);
+        let unbonding_delay = rng.gen();
+        let wasmless_transfer_cost = rng.gen();
 
         GenesisConfig {
             name,
             timestamp,
             validator_slots,
+            auction_delay,
+            locked_funds_period,
+            round_seigniorage_rate,
+            unbonding_delay,
+            wasmless_transfer_cost,
             protocol_version,
             mint_installer_bytes,
             pos_installer_bytes,
@@ -293,7 +349,7 @@ impl GenesisConfig {
 
 #[derive(Copy, Clone, DataSize, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ActivationPoint {
-    pub(crate) rank: u64,
+    pub(crate) height: u64,
 }
 
 #[derive(Clone, DataSize, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +362,7 @@ pub(crate) struct UpgradePoint {
     pub(crate) new_wasm_config: Option<WasmConfig>,
     pub(crate) new_deploy_config: Option<DeployConfig>,
     pub(crate) new_validator_slots: Option<u32>,
+    pub(crate) new_wasmless_transfer_cost: Option<u64>,
 }
 
 #[cfg(test)]
@@ -313,7 +370,7 @@ impl UpgradePoint {
     /// Generates a random instance using a `TestRng`.
     pub fn random(rng: &mut TestRng) -> Self {
         let activation_point = ActivationPoint {
-            rank: rng.gen::<u8>() as u64,
+            height: rng.gen::<u8>() as u64,
         };
         let protocol_version = Version::new(
             rng.gen_range(10, 20),
@@ -337,6 +394,7 @@ impl UpgradePoint {
             None
         };
         let new_validator_slots = rng.gen::<Option<u32>>();
+        let new_wasmless_transfer_cost = rng.gen();
 
         UpgradePoint {
             activation_point,
@@ -346,6 +404,7 @@ impl UpgradePoint {
             new_wasm_config: new_costs,
             new_deploy_config,
             new_validator_slots,
+            new_wasmless_transfer_cost,
         }
     }
 }
@@ -371,6 +430,15 @@ impl Chainspec {
     pub fn validate_config(&self) {
         self.genesis.validate_config();
     }
+
+    /// Serializes `self` and hashes the resulting bytes.
+    pub(crate) fn hash(&self) -> Digest {
+        let serialized_chainspec = bincode::serialize(self).unwrap_or_else(|error| {
+            error!("failed to serialize chainspec: {}", error);
+            vec![]
+        });
+        hash::hash(&serialized_chainspec)
+    }
 }
 
 #[cfg(test)]
@@ -393,13 +461,18 @@ impl Into<ExecConfig> for Chainspec {
             self.genesis.accounts,
             self.genesis.wasm_config,
             self.genesis.validator_slots,
+            self.genesis.auction_delay,
+            self.genesis.locked_funds_period,
+            self.genesis.round_seigniorage_rate,
+            self.genesis.unbonding_delay,
+            self.genesis.wasmless_transfer_cost,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
 
     use casper_execution_engine::shared::{
         host_function_costs::{HostFunction, HostFunctionCosts},
@@ -408,60 +481,62 @@ mod tests {
         wasm_config::WasmConfig,
     };
 
-    lazy_static! {
-        static ref EXPECTED_GENESIS_HOST_FUNCTION_COSTS: HostFunctionCosts = HostFunctionCosts {
-            read_value: HostFunction::new(127,  [0, 1, 0]),
-            read_value_local: HostFunction::new(128,  [0, 1, 0]),
-            write: HostFunction::new(140,  [0, 1, 0, 2]),
-            write_local: HostFunction::new(141,  [0, 1, 2, 3]),
-            add: HostFunction::new(100,  [0, 1, 2, 3]),
-            new_uref: HostFunction::new(122,  [0, 1, 2]),
-            load_named_keys: HostFunction::new(121,  [0, 1]),
-            ret: HostFunction::new(133,  [0, 1]),
-            get_key: HostFunction::new(113,  [0, 1, 2, 3, 4]),
-            has_key: HostFunction::new(119,  [0, 1]),
-            put_key: HostFunction::new(125,  [0, 1, 2, 3]),
-            remove_key: HostFunction::new(132,  [0, 1]),
-            revert: HostFunction::new(134,  [0]),
-            is_valid_uref: HostFunction::new(120,  [0, 1]),
-            add_associated_key: HostFunction::new(101,  [0, 1, 2]),
-            remove_associated_key: HostFunction::new(129,  [0, 1]),
-            update_associated_key: HostFunction::new(139,  [0, 1, 2]),
-            set_action_threshold: HostFunction::new(135,  [0, 1]),
-            get_caller: HostFunction::new(112,  [0]),
-            get_blocktime: HostFunction::new(111,  [0]),
-            create_purse: HostFunction::new(108,  [0, 1]),
-            transfer_to_account: HostFunction::new(138,  [0, 1, 2, 3]),
-            transfer_from_purse_to_account: HostFunction::new(136,  [0, 1, 2, 3, 4, 5]),
-            transfer_from_purse_to_purse: HostFunction::new(137,  [0, 1, 2, 3, 4, 5]),
-            get_balance: HostFunction::new(110,  [0, 1, 2]),
-            get_phase: HostFunction::new(117,  [0]),
-            get_system_contract: HostFunction::new(118,  [0, 1, 2]),
-            get_main_purse: HostFunction::new(114,  [0]),
-            read_host_buffer: HostFunction::new(126,  [0, 1, 2]),
-            create_contract_package_at_hash: HostFunction::new(106,  [0, 1]),
-            create_contract_user_group: HostFunction::new(107,  [0, 1, 2, 3, 4, 5, 6, 7]),
-            add_contract_version: HostFunction::new(102,  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
-            disable_contract_version: HostFunction::new(109,  [0, 1, 2, 3]),
-            call_contract: HostFunction::new(104,  [0, 1, 2, 3, 4, 5, 6]),
-            call_versioned_contract: HostFunction::new(105,  [0, 1, 2, 3, 4, 5, 6, 7, 8]),
-            get_named_arg_size: HostFunction::new(116,  [0, 1, 2]),
-            get_named_arg: HostFunction::new(115,  [0, 1, 2, 3]),
-            remove_contract_user_group: HostFunction::new(130,  [0, 1, 2, 3]),
-            provision_contract_user_group_uref: HostFunction::new(124,  [0, 1, 2, 3, 4]),
-            remove_contract_user_group_urefs: HostFunction::new(131,  [0, 1, 2, 3, 4, 5]),
-            print: HostFunction::new(123,  [0, 1]),
-            blake2b: HostFunction::new(133,  [0, 1, 2, 3]),
-        };
-        static ref EXPECTED_GENESIS_WASM_CONFIG: WasmConfig = WasmConfig::new(
+    static EXPECTED_GENESIS_HOST_FUNCTION_COSTS: Lazy<HostFunctionCosts> =
+        Lazy::new(|| HostFunctionCosts {
+            read_value: HostFunction::new(127, [0, 1, 0]),
+            read_value_local: HostFunction::new(128, [0, 1, 0]),
+            write: HostFunction::new(140, [0, 1, 0, 2]),
+            write_local: HostFunction::new(141, [0, 1, 2, 3]),
+            add: HostFunction::new(100, [0, 1, 2, 3]),
+            new_uref: HostFunction::new(122, [0, 1, 2]),
+            load_named_keys: HostFunction::new(121, [0, 1]),
+            ret: HostFunction::new(133, [0, 1]),
+            get_key: HostFunction::new(113, [0, 1, 2, 3, 4]),
+            has_key: HostFunction::new(119, [0, 1]),
+            put_key: HostFunction::new(125, [0, 1, 2, 3]),
+            remove_key: HostFunction::new(132, [0, 1]),
+            revert: HostFunction::new(134, [0]),
+            is_valid_uref: HostFunction::new(120, [0, 1]),
+            add_associated_key: HostFunction::new(101, [0, 1, 2]),
+            remove_associated_key: HostFunction::new(129, [0, 1]),
+            update_associated_key: HostFunction::new(139, [0, 1, 2]),
+            set_action_threshold: HostFunction::new(135, [0, 1]),
+            get_caller: HostFunction::new(112, [0]),
+            get_blocktime: HostFunction::new(111, [0]),
+            create_purse: HostFunction::new(108, [0, 1]),
+            transfer_to_account: HostFunction::new(138, [0, 1, 2, 3, 4, 5, 6]),
+            transfer_from_purse_to_account: HostFunction::new(136, [0, 1, 2, 3, 4, 5, 6, 7, 8]),
+            transfer_from_purse_to_purse: HostFunction::new(137, [0, 1, 2, 3, 4, 5, 6, 7]),
+            get_balance: HostFunction::new(110, [0, 1, 2]),
+            get_phase: HostFunction::new(117, [0]),
+            get_system_contract: HostFunction::new(118, [0, 1, 2]),
+            get_main_purse: HostFunction::new(114, [0]),
+            read_host_buffer: HostFunction::new(126, [0, 1, 2]),
+            create_contract_package_at_hash: HostFunction::new(106, [0, 1]),
+            create_contract_user_group: HostFunction::new(107, [0, 1, 2, 3, 4, 5, 6, 7]),
+            add_contract_version: HostFunction::new(102, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            disable_contract_version: HostFunction::new(109, [0, 1, 2, 3]),
+            call_contract: HostFunction::new(104, [0, 1, 2, 3, 4, 5, 6]),
+            call_versioned_contract: HostFunction::new(105, [0, 1, 2, 3, 4, 5, 6, 7, 8]),
+            get_named_arg_size: HostFunction::new(116, [0, 1, 2]),
+            get_named_arg: HostFunction::new(115, [0, 1, 2, 3]),
+            remove_contract_user_group: HostFunction::new(130, [0, 1, 2, 3]),
+            provision_contract_user_group_uref: HostFunction::new(124, [0, 1, 2, 3, 4]),
+            remove_contract_user_group_urefs: HostFunction::new(131, [0, 1, 2, 3, 4, 5]),
+            print: HostFunction::new(123, [0, 1]),
+            blake2b: HostFunction::new(133, [0, 1, 2, 3]),
+        });
+    static EXPECTED_GENESIS_WASM_CONFIG: Lazy<WasmConfig> = Lazy::new(|| {
+        WasmConfig::new(
             17, // initial_memory
             19, // max_stack_height
             EXPECTED_GENESIS_COSTS,
             EXPECTED_GENESIS_STORAGE_COSTS,
             *EXPECTED_GENESIS_HOST_FUNCTION_COSTS,
-        );
-    }
-    const EXPECTED_GENESIS_STORAGE_COSTS: StorageCosts = StorageCosts { gas_per_byte: 101 };
+        )
+    });
+
+    const EXPECTED_GENESIS_STORAGE_COSTS: StorageCosts = StorageCosts::new(101);
 
     const EXPECTED_GENESIS_COSTS: OpcodeCosts = OpcodeCosts {
         bit: 13,
@@ -503,7 +578,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::testing::{self, TestRng};
+    use crate::testing;
 
     fn check_spec(spec: Chainspec) {
         assert_eq!(spec.genesis.name, "test-chain");
@@ -532,31 +607,20 @@ mod tests {
         }
 
         assert_eq!(
-            spec.genesis
-                .highway_config
-                .genesis_era_start_timestamp
-                .millis(),
-            1600454700000
-        );
-        assert_eq!(
             spec.genesis.highway_config.era_duration,
             TimeDiff::from(180000)
         );
         assert_eq!(spec.genesis.highway_config.minimum_era_height, 9);
         assert_eq!(
-            spec.genesis.highway_config.booking_duration,
-            TimeDiff::from(14400000)
+            spec.genesis.highway_config.finality_threshold_fraction,
+            Ratio::new(2, 25)
         );
+        assert_eq!(spec.genesis.highway_config.minimum_round_exponent, 14);
+        assert_eq!(spec.genesis.highway_config.maximum_round_exponent, 19);
         assert_eq!(
-            spec.genesis.highway_config.entropy_duration,
-            TimeDiff::from(432000000)
+            spec.genesis.highway_config.reduced_reward_multiplier,
+            Ratio::new(1, 5)
         );
-        assert_eq!(
-            spec.genesis.highway_config.voting_period_duration,
-            TimeDiff::from(3628800000)
-        );
-        assert_eq!(spec.genesis.highway_config.finality_threshold_percent, 8);
-        assert_eq!(spec.genesis.highway_config.minimum_round_exponent, 13);
 
         assert_eq!(
             spec.genesis.deploy_config.max_payment_cost,
@@ -576,7 +640,7 @@ mod tests {
         assert_eq!(spec.upgrades.len(), 2);
 
         let upgrade0 = &spec.upgrades[0];
-        assert_eq!(upgrade0.activation_point, ActivationPoint { rank: 23 });
+        assert_eq!(upgrade0.activation_point, ActivationPoint { height: 23 });
         assert_eq!(upgrade0.protocol_version, Version::from((0, 2, 0)));
         assert_eq!(
             upgrade0.upgrade_installer_bytes,
@@ -594,7 +658,7 @@ mod tests {
             EXPECTED_UPGRADE_COSTS,
         );
 
-        assert_eq!(new_wasm_config.initial_memory, 17);
+        assert_eq!(new_wasm_config.max_memory, 17);
         assert_eq!(new_wasm_config.max_stack_height, 19);
 
         assert_eq!(
@@ -611,10 +675,14 @@ mod tests {
             upgrade0.new_deploy_config.unwrap().block_max_deploy_count,
             375
         );
+        assert_eq!(
+            upgrade0.new_deploy_config.unwrap().block_max_transfer_count,
+            376
+        );
         assert_eq!(upgrade0.new_deploy_config.unwrap().block_gas_limit, 38);
 
         let upgrade1 = &spec.upgrades[1];
-        assert_eq!(upgrade1.activation_point, ActivationPoint { rank: 39 });
+        assert_eq!(upgrade1.activation_point, ActivationPoint { height: 39 });
         assert_eq!(upgrade1.protocol_version, Version::from((0, 3, 0)));
         assert!(upgrade1.upgrade_installer_bytes.is_none());
         assert!(upgrade1.upgrade_installer_args.is_none());
@@ -630,7 +698,7 @@ mod tests {
 
     #[test]
     fn bincode_roundtrip() {
-        let mut rng = TestRng::new();
+        let mut rng = crate::new_rng();
         let chainspec = Chainspec::random(&mut rng);
         testing::bincode_roundtrip(&chainspec);
     }

@@ -6,7 +6,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Debug, Display, Formatter},
-    net::SocketAddr,
     time::{Duration, Instant},
 };
 
@@ -16,12 +15,13 @@ use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use super::{Config, Event as SmallNetworkEvent, GossipedAddress, SmallNetwork};
 use crate::{
     components::{
         gossiper::{self, Gossiper},
-        storage::Storage,
         Component,
     },
+    crypto::hash::Digest,
     effect::{
         announcements::{GossiperAnnouncement, NetworkAnnouncement},
         requests::{NetworkRequest, StorageRequest},
@@ -29,29 +29,29 @@ use crate::{
     },
     protocol,
     reactor::{self, EventQueueHandle, Finalize, Reactor, Runner},
-    small_network::{self, Config, GossipedAddress, NodeId, SmallNetwork},
     testing::{
         self, init_logging,
         network::{Network, NetworkedReactor},
-        ConditionCheckReactor, TestRng,
+        ConditionCheckReactor,
     },
-    types::CryptoRngCore,
+    types::NodeId,
     utils::Source,
+    NodeRng,
 };
 
 /// Test-reactor event.
-#[derive(Debug, From)]
+#[derive(Debug, From, Serialize)]
 enum Event {
     #[from]
-    SmallNet(small_network::Event<Message>),
+    SmallNet(#[serde(skip_serializing)] SmallNetworkEvent<Message>),
     #[from]
-    AddressGossiper(gossiper::Event<GossipedAddress>),
+    AddressGossiper(#[serde(skip_serializing)] gossiper::Event<GossipedAddress>),
     #[from]
-    NetworkRequest(NetworkRequest<NodeId, Message>),
+    NetworkRequest(#[serde(skip_serializing)] NetworkRequest<NodeId, Message>),
     #[from]
-    NetworkAnnouncement(NetworkAnnouncement<NodeId, Message>),
+    NetworkAnnouncement(#[serde(skip_serializing)] NetworkAnnouncement<NodeId, Message>),
     #[from]
-    AddressGossiperAnnouncement(GossiperAnnouncement<GossipedAddress>),
+    AddressGossiperAnnouncement(#[serde(skip_serializing)] GossiperAnnouncement<GossipedAddress>),
 }
 
 impl From<NetworkRequest<NodeId, gossiper::Message<GossipedAddress>>> for Event {
@@ -66,8 +66,8 @@ impl From<NetworkRequest<NodeId, protocol::Message>> for Event {
     }
 }
 
-impl From<StorageRequest<Storage>> for Event {
-    fn from(_request: StorageRequest<Storage>) -> Self {
+impl From<StorageRequest> for Event {
+    fn from(_request: StorageRequest) -> Self {
         unreachable!()
     }
 }
@@ -108,9 +108,9 @@ impl Reactor for TestReactor {
         cfg: Self::Config,
         registry: &Registry,
         event_queue: EventQueueHandle<Self::Event>,
-        _rng: &mut dyn CryptoRngCore,
+        _rng: &mut NodeRng,
     ) -> anyhow::Result<(Self, Effects<Self::Event>)> {
-        let (net, effects) = SmallNetwork::new(event_queue, cfg, false)?;
+        let (net, effects) = SmallNetwork::new(event_queue, cfg, Digest::default(), false)?;
         let gossiper_config = gossiper::Config::default();
         let address_gossiper =
             Gossiper::new_for_complete_items("address_gossiper", gossiper_config, registry)?;
@@ -127,7 +127,7 @@ impl Reactor for TestReactor {
     fn dispatch_event(
         &mut self,
         effect_builder: EffectBuilder<Self::Event>,
-        rng: &mut dyn CryptoRngCore,
+        rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         match event {
@@ -143,7 +143,7 @@ impl Reactor for TestReactor {
             Event::NetworkRequest(req) => self.dispatch_event(
                 effect_builder,
                 rng,
-                Event::SmallNet(small_network::Event::from(req)),
+                Event::SmallNet(SmallNetworkEvent::from(req)),
             ),
             Event::NetworkAnnouncement(NetworkAnnouncement::MessageReceived {
                 sender,
@@ -170,7 +170,7 @@ impl Reactor for TestReactor {
             Event::AddressGossiperAnnouncement(ann) => {
                 let GossiperAnnouncement::NewCompleteItem(gossiped_address) = ann;
                 let reactor_event =
-                    Event::SmallNet(small_network::Event::PeerAddressReceived(gossiped_address));
+                    Event::SmallNet(SmallNetworkEvent::PeerAddressReceived(gossiped_address));
                 self.dispatch_event(effect_builder, rng, reactor_event)
             }
         }
@@ -227,7 +227,7 @@ fn network_is_complete(
             return false;
         }
 
-        if net.is_isolated() {
+        if outgoing.is_empty() && incoming.is_empty() {
             return false;
         }
     }
@@ -247,10 +247,10 @@ fn network_started(net: &Network<TestReactor>) -> bool {
 /// Ensures that network cleanup and basic networking works.
 #[tokio::test]
 async fn run_two_node_network_five_times() {
-    let mut rng = TestRng::new();
+    let mut rng = crate::new_rng();
 
     // The networking port used by the tests for the root node.
-    let first_node_port = testing::unused_port_on_localhost();
+    let first_node_port = testing::unused_port_on_localhost() + 1;
 
     init_logging();
 
@@ -276,7 +276,7 @@ async fn run_two_node_network_five_times() {
             "finished setting up networking nodes"
         );
 
-        let timeout = Duration::from_secs(2);
+        let timeout = Duration::from_secs(20);
         let blocklist = HashSet::new();
         net.settle_on(
             &mut rng,
@@ -303,55 +303,6 @@ async fn run_two_node_network_five_times() {
     }
 }
 
-/// Sanity check that we fail to settle with one node gossiping the wrong address.
-#[tokio::test]
-async fn network_with_unhealthy_nodes_settles_without_them() {
-    init_logging();
-
-    let mut rng = TestRng::new();
-    for (healthy, unhealthy) in &[(1u64, 1u64), (1, 2), (1, 4), (2, 2), (4, 4), (4, 1)] {
-        let port = testing::unused_port_on_localhost();
-
-        let mut net = Network::<TestReactor>::new();
-        let (_peer1, _) = net
-            .add_node_with_config(Config::default_local_net_first_node(port), &mut rng)
-            .await
-            .unwrap();
-
-        let mut healthy_peers = HashSet::new();
-
-        for _ in 1..*healthy {
-            let (healthy_peer, _) = net
-                .add_node_with_config(Config::default_local_net(port), &mut rng)
-                .await
-                .unwrap();
-            healthy_peers.insert(healthy_peer);
-        }
-
-        let mut unhealthy_nodes = HashSet::new();
-
-        for unhealthy_address in 0..*unhealthy {
-            let (unhealthy_peer, runner3) = net
-                .add_node_with_config(Config::default_local_net(port), &mut rng)
-                .await
-                .unwrap();
-            let unhealthy = &mut runner3.reactor_mut().inner_mut().net;
-            unhealthy.public_address = SocketAddr::from(([254, 1, 1, unhealthy_address as u8], 0)); // cause the gossipped address to be wrong
-            unhealthy_nodes.insert(unhealthy_peer);
-        }
-
-        // The network should be fully connected but with only the two good nodes
-        net.settle_on(
-            &mut rng,
-            move |nodes| network_is_complete(&unhealthy_nodes, nodes),
-            Duration::from_secs(4 * (healthy + unhealthy)),
-        )
-        .await;
-
-        net.finalize().await;
-    }
-}
-
 /// Sanity check that we can bind to a real network.
 ///
 /// Very unlikely to ever fail on a real machine.
@@ -359,7 +310,7 @@ async fn network_with_unhealthy_nodes_settles_without_them() {
 async fn bind_to_real_network_interface() {
     init_logging();
 
-    let mut rng = TestRng::new();
+    let mut rng = crate::new_rng();
 
     let iface = datalink::interfaces()
         .into_iter()
@@ -399,7 +350,7 @@ async fn bind_to_real_network_interface() {
 async fn check_varying_size_network_connects() {
     init_logging();
 
-    let mut rng = TestRng::new();
+    let mut rng = crate::new_rng();
 
     // Try with a few predefined sets of network sizes.
     for &number_of_nodes in &[2u16, 3, 5, 9, 15] {

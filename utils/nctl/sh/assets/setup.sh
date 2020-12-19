@@ -2,9 +2,18 @@
 #
 # Sets assets required to run an N node network.
 # Arguments:
-#   Network ordinal identifer.
+#   Network ordinal identifier.
 #   Count of nodes to setup.
+#   Count of nodes that will be bootstraps.
 #   Count of users to setup.
+#   Delay in seconds to apply to genesis timestamp.
+
+#######################################
+# Imports
+#######################################
+
+source $NCTL/sh/utils.sh
+source $NCTL/sh/assets/setup_node.sh
 
 #######################################
 # Sets assets pertaining to network binaries.
@@ -14,56 +23,70 @@
 #   Path to network directory.
 #######################################
 function _set_bin() {
-    log "... binaries"
+    local PATH_TO_NET=${1}
+
+    log "... setting binaries"
 
     # Set directory.
-    mkdir $1/bin
+    mkdir $PATH_TO_NET/bin
 
     # Set executables.
-    cp $NCTL_CASPER_HOME/target/release/casper-client $1/bin
-    cp $NCTL_CASPER_HOME/target/release/casper-node $1/bin
+    cp $NCTL_CASPER_HOME/target/release/casper-client $PATH_TO_NET/bin
+    cp $NCTL_CASPER_HOME/target/release/casper-node $PATH_TO_NET/bin
 
-    # Set wasm:
-    # ... system contracts;
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/auction_install.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/mint_install.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/pos_install.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/standard_payment_install.wasm $1/bin
-    # ... client contracts.
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/add_bid.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/delegate.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/transfer_to_account_u512.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/transfer_to_account_u512_stored.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/undelegate.wasm $1/bin
-    cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/withdraw_bid.wasm $1/bin
+    # Set system contracts.
+	for contract in "${NCTL_CONTRACTS_SYSTEM[@]}"
+	do
+        cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/$contract $PATH_TO_NET/bin
+	done
+
+    # Set client contracts.
+	for contract in "${NCTL_CONTRACTS_CLIENT[@]}"
+	do
+        cp $NCTL_CASPER_HOME/target/wasm32-unknown-unknown/release/$contract $PATH_TO_NET/bin
+	done
 }
 
 #######################################
 # Sets assets pertaining to network chainspec.
 # Arguments:
 #   Path to network directory.
-#   Network ordinal identifer.
+#   Network ordinal identifier.
+#   Delay in seconds to apply to genesis timestamp.
 #######################################
 function _set_chainspec() {
-    log "... chainspec"
+    local PATH_TO_NET=${1}
+    local NET_ID=${2}
+    local GENESIS_DELAY=${3}
+    local PATH_TO_CHAINSPEC=$PATH_TO_NET/chainspec/chainspec.toml
+
+    log "... setting chainspec"
 
     # Set directory.
-    mkdir $1/chainspec
-
-    # Set config params.
-    GENESIS_NAME=casper-net-$2
-    GENESIS_TIMESTAMP=$(python3 -c 'from datetime import datetime, timedelta; print((datetime.utcnow() + timedelta(seconds=30)).isoformat("T") + "Z")')
-    HIGHWAY_GENESIS_ERA_START_TIMESTAMP=$(python3 -c 'from datetime import datetime, timedelta; print((datetime.utcnow() + timedelta(seconds=30)).isoformat("T") + "Z")')
+    mkdir $PATH_TO_NET/chainspec
 
     # Set config.
-    path_config=$1/chainspec/chainspec.toml
-    cp $NCTL/templates/chainspec.toml $path_config
-    sed -i "s/{GENESIS_NAME}/$GENESIS_NAME/g" $path_config > /dev/null 2>&1
-    sed -i "s/{GENESIS_TIMESTAMP}/$GENESIS_TIMESTAMP/g" $path_config > /dev/null 2>&1
-    sed -i "s/{HIGHWAY_GENESIS_ERA_START_TIMESTAMP}/$HIGHWAY_GENESIS_ERA_START_TIMESTAMP/g" $path_config > /dev/null 2>&1
+    cp $NCTL_CASPER_HOME/resources/local/chainspec.toml.in $PATH_TO_CHAINSPEC
+
+    # Set config setting: genesis.name.
+    GENESIS_NAME=$(get_chain_name $NET_ID)
+    sed -i "s/casper-example/$GENESIS_NAME/g" $PATH_TO_CHAINSPEC > /dev/null 2>&1
+
+    # Set config setting: genesis.timestamp.
+    GENESIS_TIMESTAMP=$(get_genesis_timestamp $GENESIS_DELAY)
+    sed -i "s/^\([[:alnum:]_]*timestamp\) = .*/\1 = \"${GENESIS_TIMESTAMP}\"/" $PATH_TO_CHAINSPEC > /dev/null 2>&1
+
+    # Override config settings as all paths need to point relative to nctl's assets dir:
+    #    genesis.accounts_path
+    #    genesis.mint_installer_path
+    #    genesis.pos_installer_path
+    #    genesis.standard_payment_installer_path
+    #    genesis.auction_installer_path    
+    sed -i "s?\${BASEDIR}/target/wasm32-unknown-unknown/release/?../bin/?g" $PATH_TO_CHAINSPEC > /dev/null 2>&1
+    sed -i "s?\${BASEDIR}/resources/local/?./?g" $PATH_TO_CHAINSPEC > /dev/null 2>&1
 
     # Set accounts.csv.
-    touch $1/chainspec/accounts.csv
+    touch $PATH_TO_NET/chainspec/accounts.csv
 }
 
 #######################################
@@ -75,9 +98,14 @@ function _set_chainspec() {
 #   Staking weight - validator's only.
 #######################################
 function _set_chainspec_account() {
-    public_key_hex=`cat $2`
-	cat >> $1/chainspec/accounts.csv <<- EOM
-	${public_key_hex},$3,$4
+    local PATH_TO_NET=${1}
+    local PATH_TO_ACCOUNT_KEY=${2}
+    local INITIAL_BALANCE=${3}
+    local INITIAL_WEIGHT=${4}
+
+    account_key=`cat $PATH_TO_ACCOUNT_KEY`
+	cat >> $PATH_TO_NET/chainspec/accounts.csv <<- EOM
+	${account_key},$INITIAL_BALANCE,$INITIAL_WEIGHT
 	EOM
 }
 
@@ -85,23 +113,30 @@ function _set_chainspec_account() {
 # Sets assets pertaining to network daemon.
 # Globals:
 #   NCTL - path to nctl home directory.
+#   NCTL_DAEMON_TYPE - type of daemon service manager.
 # Arguments:
 #   Path to network directory.
-#   Network ordinal identifer.
+#   Network ordinal identifier.
 #   Nodeset count.
+#   Boostrap count.
 #######################################
 function _set_daemon() {
-    log "... daemon"
+    local PATH_TO_NET=${1}
+    local NET_ID=${2}
+    local COUNT_NODES=${3}
+    local COUNT_BOOTSTRAPS=${4}
+
+    log "... setting daemon"
 
     # Set directory.
-    mkdir $1/daemon
-    mkdir $1/daemon/config
-    mkdir $1/daemon/logs
-    mkdir $1/daemon/socket
+    mkdir $PATH_TO_NET/daemon
+    mkdir $PATH_TO_NET/daemon/config
+    mkdir $PATH_TO_NET/daemon/logs
+    mkdir $PATH_TO_NET/daemon/socket
 
     # Set daemon specific artefacts.
     if [ $NCTL_DAEMON_TYPE = "supervisord" ]; then
-        source $NCTL/sh/assets/setup_supervisord.sh $1 $2 $3
+        source $NCTL/sh/assets/setup_supervisord.sh $PATH_TO_NET $NET_ID $COUNT_NODES $COUNT_BOOTSTRAPS
     fi
 }
 
@@ -111,19 +146,21 @@ function _set_daemon() {
 #   Path to network directory.
 #######################################
 function _set_faucet() {
-    log "... faucet"
+    local PATH_TO_NET=${1}
+
+    log "... setting faucet"
 
     # Set directory.
-    mkdir $1/faucet
+    mkdir $PATH_TO_NET/faucet
 
     # Set keys.
-    $1/bin/casper-client keygen -f $1/faucet > /dev/null 2>&1
+    $PATH_TO_NET/bin/casper-client keygen -f $PATH_TO_NET/faucet > /dev/null 2>&1
 
     # Set chainspec account.
     _set_chainspec_account \
-        $1 \
-        $1/faucet/public_key_hex \
-        100000000000000000 \
+        $PATH_TO_NET \
+        $PATH_TO_NET/faucet/public_key_hex \
+        $NCTL_INITIAL_BALANCE_FAUCET \
         0
 }
 
@@ -131,17 +168,21 @@ function _set_faucet() {
 # Sets assets pertaining to all nodes within network.
 # Arguments:
 #   Path to network directory.
-#   Network ordinal identifer.
-#   Count of nodes to setup.
+#   Network ordinal identifier.
+#   Count of genesis nodes to setup.
 #   Count of bootstraps to setup.
 #######################################
 function _set_nodes() {
-    log "... nodes"
+    local PATH_TO_NET=${1}
+    local NET_ID=${2}
+    local COUNT_GENESIS_NODES=${3}
+    local COUNT_BOOTSTRAPS=${4}
 
-    mkdir $1/nodes
-    for node_id in $(seq 1 $3)
+    log "... setting nodes"
+    mkdir $PATH_TO_NET/nodes
+    for IDX in $(seq 1 $(($COUNT_GENESIS_NODES * 2)))
     do
-        _set_node $1 $2 $node_id $4
+        setup_node $NET_ID $IDX $COUNT_GENESIS_NODES
     done
 }
 
@@ -149,77 +190,47 @@ function _set_nodes() {
 # Sets assets pertaining to a single node.
 # Arguments:
 #   Path to network directory.
-#   Network ordinal identifer.
-#   Node ordinal identifer.
+#   Network ordinal identifier.
+#   Node ordinal identifier.
 #   Count of bootstraps to setup.
 #######################################
 function _set_node ()
 {
+    local PATH_TO_NET=${1}
+    local NET_ID=${2}
+    local NODE_ID=${3}
+    local COUNT_NODES=${4}
+
     # Set directory.
-    mkdir $1/nodes/node-$3
-    mkdir $1/nodes/node-$3/config
-    mkdir $1/nodes/node-$3/keys
-    mkdir $1/nodes/node-$3/logs
-    mkdir $1/nodes/node-$3/storage
-
-    # Set keys.
-    $1/bin/casper-client keygen -f $1/nodes/node-$3/keys > /dev/null 2>&1
-
-    # Set config params.
-    HTTP_SERVER_BIND_PORT=$((50000 + ($2 * 100) + $node_id))
-    NETWORK_BIND_PORT=0
-    if [ $3 -le $4 ]; then
-        NETWORK_BIND_PORT=$((34452 + ($2 * 100) + $node_id))
-        NETWORK_KNOWN_ADDRESSES=""
-    else
-        NETWORK_BIND_PORT=0
-        NETWORK_KNOWN_ADDRESSES="$(get_bootstrap_known_addresses $2 $4)"
-    fi
+    mkdir $PATH_TO_NET/nodes/node-$NODE_ID
+    mkdir $PATH_TO_NET/nodes/node-$NODE_ID/config
+    mkdir $PATH_TO_NET/nodes/node-$NODE_ID/keys
+    mkdir $PATH_TO_NET/nodes/node-$NODE_ID/logs
+    mkdir $PATH_TO_NET/nodes/node-$NODE_ID/storage
 
     # Set config.
-    path_config=$1/nodes/node-$3/config/node-config.toml
-    cp $NCTL/templates/node-config.toml $path_config
-    sed -i "s/{NETWORK_BIND_PORT}/$NETWORK_BIND_PORT/g" $path_config > /dev/null 2>&1
-    sed -i "s/{NETWORK_KNOWN_ADDRESSES}/$NETWORK_KNOWN_ADDRESSES/g" $path_config > /dev/null 2>&1
-    sed -i "s/{HTTP_SERVER_BIND_PORT}/$HTTP_SERVER_BIND_PORT/g" $path_config > /dev/null 2>&1
+    cp $NCTL_CASPER_HOME/resources/local/config.toml \
+       $PATH_TO_NET/nodes/node-$NODE_ID/config/node-config.toml
+
+    # Set keys.
+    $PATH_TO_NET/bin/casper-client keygen -f $PATH_TO_NET/nodes/node-$NODE_ID/keys > /dev/null 2>&1
 
     # Set chainspec account.
-    _set_chainspec_account \
-        $1 \
-        $1/nodes/node-$3/keys/public_key_hex \
-        100000000000000000 \
-        $((100000000000000 * $3))
-}
-
-#######################################
-# Get network known addresses - i.e. those of bootstrap nodes.
-# Arguments:
-#   Network ordinal identifer.
-#   Count of bootstraps to setup.
-#######################################
-function get_bootstrap_known_addresses() {
-    result=""
-
-    for bootstrap_idx in $(seq 1 $2)
-    do
-        address=$(get_bootstrap_known_address $1 $bootstrap_idx)
-        result=$result"'"$address"',"
-    done
-
-    echo $result
-}
-
-#######################################
-# Get a network known addresses - i.e. those of bootstrap nodes.
-# Arguments:
-#   Network ordinal identifer.
-#   Node ordinal identifer.
-#######################################
-function get_bootstrap_known_address() {
-    port=$((34452 + ($1 * 100) + $2))
-    address="127.0.0.1:"$port
-
-    echo $address
+    if [ $NODE_ID -le $COUNT_NODES ]; then
+        # ... genesis validator set get staking weight as well as initial balance
+        _set_chainspec_account \
+            $PATH_TO_NET \
+            $PATH_TO_NET/nodes/node-$NODE_ID/keys/public_key_hex \
+            $NCTL_INITIAL_BALANCE_VALIDATOR \
+            $(($NCTL_VALIDATOR_BASE_WEIGHT * $NODE_ID))
+    else
+        # ... non-genesis validator set only get initial balance
+        _set_chainspec_account \
+            $PATH_TO_NET \
+            $PATH_TO_NET/nodes/node-$NODE_ID/keys/public_key_hex \
+            $NCTL_INITIAL_BALANCE_VALIDATOR \
+            0    
+    fi
 }
 
 #######################################
@@ -229,135 +240,131 @@ function get_bootstrap_known_address() {
 #   Count of users to setup.
 #######################################
 function _set_users() {
-    log "... users"
+    local PATH_TO_NET=${1}
+    local COUNT_USERS=${2}
 
-    mkdir $1/users
-    for user_idx in $(seq 1 $2)
+    log "... setting users"
+    mkdir $PATH_TO_NET/users
+    for IDX in $(seq 1 $COUNT_USERS)
     do
-        _set_user $1 $user_idx
+        $PATH_TO_NET/bin/casper-client keygen -f $PATH_TO_NET/users/user-$IDX > /dev/null 2>&1
+        _set_chainspec_account \
+            $PATH_TO_NET \
+            $PATH_TO_NET/users/user-$IDX/public_key_hex \
+            $NCTL_INITIAL_BALANCE_VALIDATOR \
+            0    
     done
-}
-
-#######################################
-# Sets assets pertaining to a single user.
-# Arguments:
-#   Path to network directory.
-#   Path to user directory.
-#######################################
-function _set_user() {
-    $1/bin/casper-client keygen -f $1/users/user-$2 > /dev/null 2>&1
 }
 
 #######################################
 # Sets assets pertaining to network variables.
 # Arguments:
 #   Path to network directory.
-#   Network ordinal identifer.
+#   Network ordinal identifier.
 #   Count of nodes to setup.
 #   Count of bootstraps to setup.
 #   Count of users to setup.
 #######################################
 function _set_vars() {
-    log "... variables"
+    local PATH_TO_NET=${1}
+    local NET_ID=${2}
+    local COUNT_NODES=${3}
+    local COUNT_BOOTSTRAPS=${4}
+    local COUNT_USERS=${5}
 
-    touch $1/vars
-	cat >> $1/vars <<- EOM
+    log "... setting variables"
+
+    touch $PATH_TO_NET/vars
+	cat >> $PATH_TO_NET/vars <<- EOM
 # Count of nodes to setup.
-export NCTL_NET_BOOTSTRAP_COUNT=$4
+export NCTL_NET_BOOTSTRAP_COUNT=$COUNT_BOOTSTRAPS
 
 # Network ordinal identifier.
-export NCTL_NET_IDX=$2
+export NCTL_NET_IDX=$NET_ID
 
 # Count of nodes to setup.
-export NCTL_NET_NODE_COUNT=$3
+export NCTL_NET_NODE_COUNT=$COUNT_NODES
 
 # Count of users to setup.
-export NCTL_NET_USER_COUNT=$5
+export NCTL_NET_USER_COUNT=$COUNT_USERS
 	EOM
 }
 
 #######################################
 # Main
 # Arguments:
-#   Network ordinal identifer.
+#   Network ordinal identifier.
 #   Count of nodes to setup.
 #   Count of bootstraps to setup.
 #   Count of users to setup.
+#   Delay in seconds to apply to genesis timestamp.
 #######################################
 function _main() {
+    local NET_ID=${1}
+    local COUNT_NODES=${2}
+    local COUNT_BOOTSTRAPS=${3}
+    local COUNT_USERS=${4}
+    local GENESIS_DELAY=${5}
+
     # Set directory.
-    net_path=$NCTL/assets/net-$1
+    PATH_TO_NET=$(get_path_to_net $NET_ID)
 
     # Teardown existing.
-    if [ -d $net_path ]; then
-        source $NCTL/sh/assets/teardown.sh net=$1
+    if [ -d $PATH_TO_NET ]; then
+        source $NCTL/sh/assets/teardown.sh net=$NET_ID
     fi
 
-    log "network #$1: setting up assets ... please wait"
+    log "net-$NET_ID: setting up assets ... please wait"
 
     # Make directory.
-    mkdir -p $net_path
+    mkdir -p $PATH_TO_NET
+
+    # Set vars.
+    _set_vars $PATH_TO_NET $NET_ID $COUNT_NODES $COUNT_BOOTSTRAPS $COUNT_USERS
 
     # Set artefacts.
-    log "setting network artefacts:"
-    _set_bin $net_path
-    _set_chainspec $net_path $1
-    _set_daemon $net_path $1 $2
-    _set_faucet $net_path
-    _set_nodes $net_path $1 $2 $3
-    _set_users $net_path $4
-    _set_vars $net_path $1 $2 $3 $4
+    _set_bin $PATH_TO_NET
+    _set_chainspec $PATH_TO_NET $NET_ID $GENESIS_DELAY
+    _set_daemon $PATH_TO_NET $NET_ID $COUNT_NODES $COUNT_BOOTSTRAPS
+    _set_faucet $PATH_TO_NET
+    _set_nodes $PATH_TO_NET $NET_ID $COUNT_NODES $COUNT_BOOTSTRAPS
+    _set_users $PATH_TO_NET $COUNT_USERS
 
-    log "network #$1: assets set up"
+    log "net-$NET_ID: assets set up"
 }
-
-#######################################
-# CLI entry point
-# Arguments:
-#   Network ordinal identifer.
-#   Count of nodes to setup.
-#   Count of users to setup.
-#######################################
-
-# Import utils.
-source $NCTL/sh/utils/misc.sh
 
 #######################################
 # Destructure input args.
 #######################################
 
-# Unset to avoid parameter collisions.
-unset bootstraps
-unset net
-unset nodes
-unset users
+unset BOOTSTRAP_COUNT
+unset GENESIS_DELAY_SECONDS
+unset NET_ID
+unset NODE_COUNT
+unset USER_COUNT
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        bootstraps) bootstraps=${VALUE} ;;
-        net) net=${VALUE} ;;
-        nodes) nodes=${VALUE} ;;
-        users) users=${VALUE} ;;
+        bootstraps) BOOTSTRAP_COUNT=${VALUE} ;;
+        delay) GENESIS_DELAY_SECONDS=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        nodes) NODE_COUNT=${VALUE} ;;
+        users) USER_COUNT=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-bootstraps=${bootstraps:-1}
-net=${net:-1}
-nodes=${nodes:-5}
-users=${users:-5}
+BOOTSTRAP_COUNT=${BOOTSTRAP_COUNT:-3}
+GENESIS_DELAY_SECONDS=${GENESIS_DELAY_SECONDS:-30}
+NET_ID=${NET_ID:-1}
+NODE_COUNT=${NODE_COUNT:-5}
+USER_COUNT=${USER_COUNT:-5}
 
-#######################################
-# Main
-#######################################
-
-# Execute when inputs are valid.
-if [ $bootstraps -ge $nodes ]; then
+if [ $BOOTSTRAP_COUNT -ge $NODE_COUNT ]; then
     log_error "Invalid input: bootstraps MUST BE < nodes"
 else
-    _main $net $nodes $bootstraps $users
+    _main $NET_ID $NODE_COUNT $BOOTSTRAP_COUNT $USER_COUNT $GENESIS_DELAY_SECONDS
 fi

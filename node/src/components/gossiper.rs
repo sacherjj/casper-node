@@ -19,15 +19,16 @@ use std::{
 use tracing::{debug, error};
 
 use crate::{
-    components::{small_network::NodeId, storage::Storage, Component},
+    components::Component,
     effect::{
         announcements::GossiperAnnouncement,
         requests::{NetworkRequest, StorageRequest},
         EffectBuilder, EffectExt, Effects,
     },
     protocol::Message as NodeMessage,
-    types::{CryptoRngCore, Deploy, DeployHash, Item},
+    types::{Deploy, DeployHash, Item, NodeId},
     utils::Source,
+    NodeRng,
 };
 pub use config::Config;
 pub use error::Error;
@@ -42,7 +43,7 @@ pub trait ReactorEventT<T>:
     From<Event<T>>
     + From<NetworkRequest<NodeId, Message<T>>>
     + From<NetworkRequest<NodeId, NodeMessage>>
-    + From<StorageRequest<Storage>>
+    + From<StorageRequest>
     + From<GossiperAnnouncement<T>>
     + Send
     + 'static
@@ -59,7 +60,7 @@ where
     REv: From<Event<T>>
         + From<NetworkRequest<NodeId, Message<T>>>
         + From<NetworkRequest<NodeId, NodeMessage>>
-        + From<StorageRequest<Storage>>
+        + From<StorageRequest>
         + From<GossiperAnnouncement<T>>
         + Send
         + 'static,
@@ -202,7 +203,11 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
         let message = Message::Gossip(item_id);
         effect_builder
             .gossip_message(message, count, exclude_peers)
-            .event(move |peers| Event::GossipedTo { item_id, peers })
+            .event(move |peers| Event::GossipedTo {
+                item_id,
+                requested_count: count,
+                peers,
+            })
     }
 
     /// Handles the response from the network component detailing which peers it gossiped to.
@@ -210,6 +215,7 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
         &mut self,
         effect_builder: EffectBuilder<REv>,
         item_id: T::Id,
+        requested_count: usize,
         peers: HashSet<NodeId>,
     ) -> Effects<Event<T>> {
         // We don't have any peers to gossip to, so pause the process, which will eventually result
@@ -223,6 +229,13 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
                 item_id
             );
             return Effects::new();
+        }
+
+        // We didn't gossip to as many peers as was requested.  Reduce the table entry's in-flight
+        // count.
+        if peers.len() < requested_count {
+            self.table
+                .reduce_in_flight_count(&item_id, requested_count - peers.len());
         }
 
         // Set timeouts to check later that the specified peers all responded.
@@ -287,7 +300,9 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
                         return self.check_get_from_peer_timeout(effect_builder, item_id, holder);
                     }
                 };
-                let mut effects = effect_builder.send_message(holder, request).ignore();
+                let mut effects = effect_builder
+                    .send_message(holder.clone(), request)
+                    .ignore();
                 effects.extend(
                     effect_builder
                         .set_timeout(self.get_from_peer_timeout)
@@ -312,10 +327,10 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
     ) -> Effects<Event<T>> {
         let action = if T::ID_IS_COMPLETE_ITEM {
             self.table
-                .new_complete_data(&item_id, Some(sender))
+                .new_complete_data(&item_id, Some(sender.clone()))
                 .map_or_else(|| GossipAction::Noop, GossipAction::ShouldGossip)
         } else {
-            self.table.new_partial_data(&item_id, sender)
+            self.table.new_partial_data(&item_id, sender.clone())
         };
 
         match action {
@@ -352,7 +367,7 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
                     item_id,
                     is_already_held: false,
                 };
-                let mut effects = effect_builder.send_message(sender, reply).ignore();
+                let mut effects = effect_builder.send_message(sender.clone(), reply).ignore();
                 effects.extend(
                     effect_builder
                         .set_timeout(self.get_from_peer_timeout)
@@ -389,7 +404,11 @@ impl<T: Item + 'static, REv: ReactorEventT<T>> Gossiper<T, REv> {
             if !T::ID_IS_COMPLETE_ITEM {
                 // `sender` doesn't hold the full item; get the item from the component responsible
                 // for holding it, then send it to `sender`.
-                effects.extend((self.get_from_holder)(effect_builder, item_id, sender));
+                effects.extend((self.get_from_holder)(
+                    effect_builder,
+                    item_id,
+                    sender.clone(),
+                ));
             }
             self.table.we_infected(&item_id, sender)
         };
@@ -463,16 +482,18 @@ where
     fn handle_event(
         &mut self,
         effect_builder: EffectBuilder<REv>,
-        _rng: &mut dyn CryptoRngCore,
+        _rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         let effects = match event {
             Event::ItemReceived { item_id, source } => {
                 self.handle_item_received(effect_builder, item_id, source)
             }
-            Event::GossipedTo { item_id, peers } => {
-                self.gossiped_to(effect_builder, item_id, peers)
-            }
+            Event::GossipedTo {
+                item_id,
+                requested_count,
+                peers,
+            } => self.gossiped_to(effect_builder, item_id, requested_count, peers),
             Event::CheckGossipTimeout { item_id, peer } => {
                 self.check_gossip_timeout(effect_builder, item_id, peer)
             }

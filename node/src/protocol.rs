@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     components::{consensus, gossiper, small_network::GossipedAddress},
-    types::{Deploy, Item, Tag},
+    types::{Deploy, FinalitySignature, Item, Tag},
 };
 
 /// Reactor message.
@@ -38,6 +38,9 @@ pub enum Message {
         /// The serialized item.
         serialized_item: Vec<u8>,
     },
+    /// Finality signature.
+    #[from]
+    FinalitySignature(Box<FinalitySignature>),
 }
 
 impl Message {
@@ -75,6 +78,9 @@ impl Debug for Message {
                 .field("tag", tag)
                 .field("serialized_item", &HexFmt(serialized_item))
                 .finish(),
+            Message::FinalitySignature(fs) => {
+                f.debug_tuple("FinalitySignature").field(&fs).finish()
+            }
         }
     }
 }
@@ -94,6 +100,9 @@ impl Display for Message {
                 tag,
                 serialized_item,
             } => write!(f, "GetResponse({}-{:10})", tag, HexFmt(serialized_item)),
+            Message::FinalitySignature(fs) => {
+                write!(f, "FinalitySignature::({})", fs)
+            }
         }
     }
 }

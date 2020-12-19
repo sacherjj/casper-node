@@ -1,53 +1,33 @@
 #!/usr/bin/env bash
-#
-# Renders a user's account balance.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifier.
 
-# Import utils.
-source $NCTL/sh/utils/misc.sh
+source $NCTL/sh/utils.sh
+source $NCTL/sh/views/funcs.sh
 
-#######################################
-# Destructure input args.
-#######################################
-
-# Unset to avoid parameter collisions.
-unset net
-unset node
-unset user
+unset NET_ID
+unset NODE_ID
+unset USER_ID
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        net) net=${VALUE} ;;
-        node) node=${VALUE} ;;
-        user) user=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        node) NODE_ID=${VALUE} ;;
+        user) USER_ID=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-net=${net:-1}
-node=${node:-1}
-user=${user:-1}
+NET_ID=${NET_ID:-1}
+NODE_ID=${NODE_ID:-1}
+USER_ID=${USER_ID:-"all"}
 
-#######################################
-# Main
-#######################################
-
-state_root_hash=$(source $NCTL/sh/views/view_chain_state_root_hash.sh)
-account_key=$(cat $NCTL/assets/net-$net/users/user-$user/public_key_hex)
-purse_uref=$(
-    source $NCTL/sh/views/view_chain_account.sh net=$net root-hash=$state_root_hash account-key=$account_key \
-    | jq '.Account.main_purse' \
-    | sed -e 's/^"//' -e 's/"$//'
-    ) 
-
-source $NCTL/sh/views/view_chain_account_balance.sh net=$net node=$node \
-    root-hash=$state_root_hash \
-    purse-uref=$purse_uref \
-    typeof="user-"$user
+if [ $USER_ID = "all" ]; then
+    for USER_ID in $(seq 1 $(get_count_of_users $NET_ID))
+    do
+        render_account_balance $NET_ID $NODE_ID $NCTL_ACCOUNT_TYPE_USER $USER_ID
+    done
+else
+    render_account_balance $NET_ID $NODE_ID $NCTL_ACCOUNT_TYPE_USER $USER_ID
+fi

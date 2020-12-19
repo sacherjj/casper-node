@@ -9,9 +9,9 @@ use tracing::warn;
 use wasmi::ModuleRef;
 
 use casper_types::{
-    account::AccountHash, auction, bytesrepr::FromBytes, contracts::NamedKeys, AccessRights,
-    BlockTime, CLTyped, CLValue, ContractPackage, EntryPoint, EntryPointType, Key, Phase,
-    ProtocolVersion, RuntimeArgs,
+    account::AccountHash, auction, bytesrepr::FromBytes, contracts::NamedKeys, proof_of_stake,
+    AccessRights, BlockTime, CLTyped, CLValue, ContractPackage, DeployHash, EntryPoint,
+    EntryPointType, Key, Phase, ProtocolVersion, RuntimeArgs,
 };
 
 use crate::{
@@ -100,7 +100,7 @@ impl Executor {
         named_keys: &mut NamedKeys,
         authorization_keys: BTreeSet<AccountHash>,
         blocktime: BlockTime,
-        deploy_hash: [u8; 32],
+        deploy_hash: DeployHash,
         gas_limit: Gas,
         protocol_version: ProtocolVersion,
         correlation_id: CorrelationId,
@@ -118,8 +118,11 @@ impl Executor {
         let entry_point_type = entry_point.entry_point_type();
         let entry_point_access = entry_point.access();
 
-        let (instance, memory) =
-            on_fail_charge!(instance_and_memory(module.clone(), protocol_version));
+        let (instance, memory) = on_fail_charge!(instance_and_memory(
+            module.clone(),
+            protocol_version,
+            protocol_data.wasm_config()
+        ));
 
         let access_rights = {
             let keys: Vec<Key> = named_keys.values().cloned().collect();
@@ -127,15 +130,15 @@ impl Executor {
         };
 
         let hash_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let uref_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let target_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let gas_counter: Gas = Gas::default();
@@ -282,7 +285,7 @@ impl Executor {
         account: &Account,
         authorization_keys: BTreeSet<AccountHash>,
         blocktime: BlockTime,
-        deploy_hash: [u8; 32],
+        deploy_hash: DeployHash,
         gas_limit: Gas,
         protocol_version: ProtocolVersion,
         correlation_id: CorrelationId,
@@ -307,7 +310,8 @@ impl Executor {
                     );
                 }
             }
-            DirectSystemContractCall::FinalizePayment => {
+            DirectSystemContractCall::FinalizePayment
+            | DirectSystemContractCall::GetPaymentPurse => {
                 if protocol_data.proof_of_stake() != base_key.into_seed() {
                     panic!(
                         "{} should only be called with the proof of stake contract",
@@ -334,15 +338,15 @@ impl Executor {
         }
 
         let hash_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let uref_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let transfer_address_generator = {
-            let generator = AddressGenerator::new(&deploy_hash, phase);
+            let generator = AddressGenerator::new(deploy_hash.as_bytes(), phase);
             Rc::new(RefCell::new(generator))
         };
         let gas_counter = Gas::default(); // maybe const?
@@ -481,7 +485,7 @@ impl Executor {
         account: &mut Account,
         authorization_keys: BTreeSet<AccountHash>,
         blocktime: BlockTime,
-        deploy_hash: [u8; 32],
+        deploy_hash: DeployHash,
         gas_limit: Gas,
         hash_address_generator: Rc<RefCell<AddressGenerator>>,
         uref_address_generator: Rc<RefCell<AddressGenerator>>,
@@ -568,7 +572,7 @@ impl Executor {
         account: &'a Account,
         authorization_keys: BTreeSet<AccountHash>,
         blocktime: BlockTime,
-        deploy_hash: [u8; 32],
+        deploy_hash: DeployHash,
         gas_limit: Gas,
         hash_address_generator: Rc<RefCell<AddressGenerator>>,
         uref_address_generator: Rc<RefCell<AddressGenerator>>,
@@ -616,7 +620,11 @@ impl Executor {
             transfers,
         );
 
-        let (instance, memory) = instance_and_memory(module.clone(), protocol_version)?;
+        let (instance, memory) = instance_and_memory(
+            module.clone(),
+            protocol_version,
+            protocol_data.wasm_config(),
+        )?;
 
         let runtime = Runtime::new(
             self.config,
@@ -638,6 +646,7 @@ pub enum DirectSystemContractCall {
     CreatePurse,
     Transfer,
     GetEraValidators,
+    GetPaymentPurse,
 }
 
 impl DirectSystemContractCall {
@@ -650,6 +659,7 @@ impl DirectSystemContractCall {
             DirectSystemContractCall::CreatePurse => "create",
             DirectSystemContractCall::Transfer => "transfer",
             DirectSystemContractCall::GetEraValidators => auction::METHOD_GET_ERA_VALIDATORS,
+            DirectSystemContractCall::GetPaymentPurse => proof_of_stake::METHOD_GET_PAYMENT_PURSE,
         }
     }
 
@@ -694,6 +704,14 @@ impl DirectSystemContractCall {
                     extra_keys,
                 ),
             DirectSystemContractCall::GetEraValidators => runtime.call_host_auction(
+                protocol_version,
+                entry_point_name,
+                named_keys,
+                runtime_args,
+                extra_keys,
+            ),
+
+            DirectSystemContractCall::GetPaymentPurse => runtime.call_host_proof_of_stake(
                 protocol_version,
                 entry_point_name,
                 named_keys,

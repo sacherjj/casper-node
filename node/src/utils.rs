@@ -15,8 +15,9 @@ use std::{
 };
 
 use datasize::DataSize;
-use lazy_static::lazy_static;
 use libc::{c_long, sysconf, _SC_PAGESIZE};
+use once_cell::sync::Lazy;
+use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -28,18 +29,16 @@ pub(crate) use round_robin::WeightedRoundRobin;
 /// Sensible default for many if not all systems.
 const DEFAULT_PAGE_SIZE: usize = 4096;
 
-lazy_static! {
-    /// OS page size.
-    pub static ref OS_PAGE_SIZE: usize = {
-        // https://www.gnu.org/software/libc/manual/html_node/Sysconf.html
-        let value: c_long = unsafe { sysconf(_SC_PAGESIZE) };
-        if value <= 0 {
-            DEFAULT_PAGE_SIZE
-        } else {
-            value as usize
-        }
-    };
-}
+/// OS page size.
+pub static OS_PAGE_SIZE: Lazy<usize> = Lazy::new(|| {
+    // https://www.gnu.org/software/libc/manual/html_node/Sysconf.html
+    let value: c_long = unsafe { sysconf(_SC_PAGESIZE) };
+    if value <= 0 {
+        DEFAULT_PAGE_SIZE
+    } else {
+        value as usize
+    }
+});
 
 /// Parses a network address from a string, with DNS resolution.
 pub(crate) fn resolve_address(addr: &str) -> io::Result<SocketAddr> {
@@ -93,7 +92,7 @@ where
 
 /// Error reading a file.
 #[derive(Debug, Error)]
-#[error("could not read {0}: {error}", .path.display())]
+#[error("could not read '{0}': {error}", .path.display())]
 pub struct ReadFileError {
     /// Path that failed to be read.
     path: PathBuf,
@@ -104,7 +103,7 @@ pub struct ReadFileError {
 
 /// Error writing a file
 #[derive(Debug, Error)]
-#[error("could not write to {0}: {error}", .path.display())]
+#[error("could not write to '{0}': {error}", .path.display())]
 pub struct WriteFileError {
     /// Path that failed to be written to.
     path: PathBuf,
@@ -189,7 +188,7 @@ impl<T> WithDir<T> {
 }
 
 /// The source of a piece of data.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Source<I> {
     /// A peer with the wrapped ID.
     Peer(I),
@@ -197,11 +196,11 @@ pub enum Source<I> {
     Client,
 }
 
-impl<I: Copy> Source<I> {
+impl<I: Clone> Source<I> {
     /// If `self` represents a peer, returns its ID, otherwise returns `None`.
     pub(crate) fn node_id(&self) -> Option<I> {
         match self {
-            Source::Peer(node_id) => Some(*node_id),
+            Source::Peer(node_id) => Some(node_id.clone()),
             Source::Client => None,
         }
     }

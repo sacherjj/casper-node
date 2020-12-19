@@ -8,7 +8,7 @@
 //! While the [`main`](fn.main.html) function is the central entrypoint for the node application,
 //! its core event loop is found inside the [reactor](reactor/index.html).
 
-#![doc(html_root_url = "https://docs.rs/casper-node/1.5.0")]
+#![doc(html_root_url = "https://docs.rs/casper-node/0.3.1")]
 #![doc(
     html_favicon_url = "https://raw.githubusercontent.com/CasperLabs/casper-node/master/images/CasperLabs_Logo_Favicon_RGB_50px.png",
     html_logo_url = "https://raw.githubusercontent.com/CasperLabs/casper-node/master/images/CasperLabs_Logo_Symbol_RGB.png",
@@ -36,20 +36,26 @@ pub mod tls;
 pub mod types;
 pub mod utils;
 
-use ansi_term::Color::Red;
-use lazy_static::lazy_static;
+use std::sync::{atomic::AtomicBool, Arc};
 
-pub(crate) use components::small_network;
+use ansi_term::Color::Red;
+use once_cell::sync::Lazy;
+#[cfg(not(test))]
+use rand::SeedableRng;
+
 pub use components::{
-    api_server::{rpcs, Config as ApiServerConfig},
     chainspec_loader::{Chainspec, Error as ChainspecError},
     consensus::Config as ConsensusConfig,
     contract_runtime::Config as ContractRuntimeConfig,
+    event_stream_server::Config as EventStreamServerConfig,
     fetcher::Config as FetcherConfig,
     gossiper::{Config as GossipConfig, Error as GossipError},
+    rest_server::Config as RestServerConfig,
+    rpc_server::{rpcs, Config as RpcServerConfig},
     small_network::{Config as SmallNetworkConfig, Error as SmallNetworkError},
     storage::{Config as StorageConfig, Error as StorageError},
 };
+pub use types::NodeRng;
 pub use utils::OS_PAGE_SIZE;
 
 /// The maximum thread count which should be spawned by the tokio runtime.
@@ -80,11 +86,30 @@ fn version_string(color: bool) -> String {
     version
 }
 
-lazy_static! {
-    /// Color version string for the compiled node. Filled in at build time, output allocated at
-    /// runtime.
-    pub static ref VERSION_STRING_COLOR: String = version_string(true);
+/// Color version string for the compiled node. Filled in at build time, output allocated at
+/// runtime.
+pub static VERSION_STRING_COLOR: Lazy<String> = Lazy::new(|| version_string(true));
 
-    /// Version string for the compiled node. Filled in at build time, output allocated at runtime.
-    pub static ref VERSION_STRING: String = version_string(false);
+/// Version string for the compiled node. Filled in at build time, output allocated at runtime.
+pub static VERSION_STRING: Lazy<String> = Lazy::new(|| version_string(false));
+
+/// Global flag that indicates the currently running reactor should dump its event queue.
+pub static QUEUE_DUMP_REQUESTED: Lazy<Arc<AtomicBool>> =
+    Lazy::new(|| Arc::new(AtomicBool::new(false)));
+
+/// Setup UNIX signal hooks for current application.
+pub fn setup_signal_hooks() {
+    let _ = signal_hook::flag::register(libc::SIGUSR1, QUEUE_DUMP_REQUESTED.clone());
+}
+
+/// Constructs a new `NodeRng`.
+#[cfg(not(test))]
+pub fn new_rng() -> NodeRng {
+    NodeRng::from_entropy()
+}
+
+/// Constructs a new `NodeRng`.
+#[cfg(test)]
+pub fn new_rng() -> NodeRng {
+    NodeRng::new()
 }

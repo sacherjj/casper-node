@@ -10,76 +10,78 @@ use super::validators::ValidatorIndex;
 pub(crate) enum EndorsementError {
     #[error("The creator is not a validator.")]
     Creator,
+    #[error("The creator is banned.")]
+    Banned,
     #[error("The signature is invalid.")]
     Signature,
+    #[error("The list of endorsements is empty.")]
+    Empty,
 }
 
-/// Testimony that creator of `vote` was seen honest
+/// Testimony that creator of `unit` was seen honest
 /// by `endorser` at the moment of creating this endorsement.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "C::Hash: Serialize",
     deserialize = "C::Hash: Deserialize<'de>",
 ))]
 pub(crate) struct Endorsement<C: Context> {
-    /// Vote being endorsed.
-    vote: C::Hash,
+    /// Unit being endorsed.
+    unit: C::Hash,
     /// The validator who created and sent this endorsement.
     creator: ValidatorIndex,
-    /// Original signature.
-    signature: C::Signature,
 }
 
 impl<C: Context> Endorsement<C> {
-    pub fn new(vote: C::Hash, creator: ValidatorIndex, signature: C::Signature) -> Self {
+    pub(crate) fn new(vhash: C::Hash, creator: ValidatorIndex) -> Self {
         Endorsement {
-            vote,
+            unit: vhash,
             creator,
-            signature,
         }
-    }
-
-    pub(crate) fn validator_idx(&self) -> ValidatorIndex {
-        self.creator
     }
 
     pub(crate) fn hash(&self) -> C::Hash {
         <C as Context>::hash(
-            &bincode::serialize(&(self.vote, self.creator)).expect("serialize endorsement"),
+            &bincode::serialize(&(self.unit, self.creator)).expect("serialize endorsement"),
         )
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Testimony that creator of `unit` was seen honest
+/// by `endorser` at the moment of creating this endorsement.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "C::Hash: Serialize",
-    deserialize = "C::Hash: Deserialize<'de>",
+    serialize = "C::Signature: Serialize",
+    deserialize = "C::Signature: Deserialize<'de>",
 ))]
-pub(crate) struct Endorsements<C: Context> {
-    pub(crate) vote: C::Hash,
-    pub(crate) endorsers: Vec<(ValidatorIndex, C::Signature)>,
+pub(crate) struct SignedEndorsement<C: Context> {
+    /// Original endorsement,
+    endorsement: Endorsement<C>,
+    /// Original signature.
+    signature: C::Signature,
 }
 
-impl<C: Context> Endorsements<C> {
-    pub fn new<I: IntoIterator<Item = Endorsement<C>>>(endorsements: I) -> Self {
-        let mut iter = endorsements.into_iter().peekable();
-        let vote: C::Hash = iter.peek().expect("non-empty iter").vote;
-        let endorsers = iter
-            .map(|e| {
-                assert_eq!(e.vote, vote, "endorsements for different votes.");
-                (e.creator, e.signature)
-            })
-            .collect();
-        Endorsements { vote, endorsers }
+impl<C: Context> SignedEndorsement<C> {
+    pub fn new(endorsement: Endorsement<C>, signature: C::Signature) -> Self {
+        SignedEndorsement {
+            endorsement,
+            signature,
+        }
     }
 
-    /// Returns hash of the endorsed vode.
-    pub fn vote(&self) -> &C::Hash {
-        &self.vote
+    pub(crate) fn unit(&self) -> &C::Hash {
+        &self.endorsement.unit
     }
 
-    /// Returns an iterator over validator indexes that endorsed the `vote`.
-    pub fn validator_ids(&self) -> impl Iterator<Item = &ValidatorIndex> {
-        self.endorsers.iter().map(|(v, _)| v)
+    pub(crate) fn validator_idx(&self) -> ValidatorIndex {
+        self.endorsement.creator
+    }
+
+    pub(crate) fn signature(&self) -> &C::Signature {
+        &self.signature
+    }
+
+    pub(crate) fn hash(&self) -> C::Hash {
+        self.endorsement.hash()
     }
 }

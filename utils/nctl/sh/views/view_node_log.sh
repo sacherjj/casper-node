@@ -1,44 +1,22 @@
 #!/usr/bin/env bash
-#
-# Displays node logs.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifier.
-#   Node ordinal identifier.
-#   Log type.
 
-# Import utils.
-source $NCTL/sh/utils/misc.sh
+source $NCTL/sh/utils.sh
+source $NCTL/sh/views/funcs.sh
 
-#######################################
-# Destructure input args.
-#######################################
-
-# Unset to avoid parameter collisions.
-unset net
-unset node
-unset typeof
+unset NET_ID
+unset NODE_ID
+unset LOG_TYPE
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        net) net=${VALUE} ;;
-        node) node=${VALUE} ;;
-        typeof) typeof=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        node) NODE_ID=${VALUE} ;;
+        typeof) LOG_TYPE=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-net=${net:-1}
-node=${node:-1}
-typeof=${typeof:-stdout}
-
-#######################################
-# Main
-#######################################
-
-vi $NCTL/assets/net-$net/nodes/node-$node/logs/$typeof.log
+less $(get_path_to_node ${NET_ID:-1} ${NODE_ID:-1})/logs/${LOG_TYPE:-stdout}.log

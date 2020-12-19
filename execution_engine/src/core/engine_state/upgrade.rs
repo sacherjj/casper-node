@@ -1,6 +1,8 @@
 use std::fmt;
 
-use casper_types::{bytesrepr, Key, ProtocolVersion};
+use num_rational::Ratio;
+
+use casper_types::{auction::EraId, bytesrepr, Key, ProtocolVersion};
 
 use crate::{
     core::engine_state::execution_effect::ExecutionEffect,
@@ -64,6 +66,11 @@ pub struct UpgradeConfig {
     wasm_config: Option<WasmConfig>,
     activation_point: Option<ActivationPoint>,
     new_validator_slots: Option<u32>,
+    new_auction_delay: Option<u64>,
+    new_locked_funds_period: Option<EraId>,
+    new_round_seigniorage_rate: Option<Ratio<u64>>,
+    new_unbonding_delay: Option<EraId>,
+    new_wasmless_transfer_cost: Option<u64>,
 }
 
 impl UpgradeConfig {
@@ -77,6 +84,11 @@ impl UpgradeConfig {
         wasm_config: Option<WasmConfig>,
         activation_point: Option<ActivationPoint>,
         new_validator_slots: Option<u32>,
+        new_auction_delay: Option<u64>,
+        new_locked_funds_period: Option<EraId>,
+        new_round_seigniorage_rate: Option<Ratio<u64>>,
+        new_unbonding_delay: Option<EraId>,
+        new_wasmless_transfer_cost: Option<u64>,
     ) -> Self {
         UpgradeConfig {
             pre_state_hash,
@@ -87,6 +99,11 @@ impl UpgradeConfig {
             wasm_config,
             activation_point,
             new_validator_slots,
+            new_auction_delay,
+            new_locked_funds_period,
+            new_round_seigniorage_rate,
+            new_unbonding_delay,
+            new_wasmless_transfer_cost,
         }
     }
 
@@ -122,5 +139,25 @@ impl UpgradeConfig {
 
     pub fn new_validator_slots(&self) -> Option<u32> {
         self.new_validator_slots
+    }
+
+    pub fn new_auction_delay(&self) -> Option<u64> {
+        self.new_auction_delay
+    }
+
+    pub fn new_locked_funds_period(&self) -> Option<EraId> {
+        self.new_locked_funds_period
+    }
+
+    pub fn new_round_seigniorage_rate(&self) -> Option<Ratio<u64>> {
+        self.new_round_seigniorage_rate
+    }
+
+    pub fn new_unbonding_delay(&self) -> Option<EraId> {
+        self.new_unbonding_delay
+    }
+
+    pub fn new_wasmless_transfer_cost(&self) -> Option<u64> {
+        self.new_wasmless_transfer_cost
     }
 }

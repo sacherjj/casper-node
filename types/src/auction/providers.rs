@@ -1,8 +1,9 @@
 use crate::{
     account::AccountHash,
+    auction::{EraId, EraInfo},
     bytesrepr::{FromBytes, ToBytes},
     system_contract_errors::auction::Error,
-    CLTyped, Key, TransferResult, URef, BLAKE2B_DIGEST_LENGTH, U512,
+    ApiError, CLTyped, Key, TransferResult, URef, BLAKE2B_DIGEST_LENGTH, U512,
 };
 
 /// Provider of runtime host functionality.
@@ -43,7 +44,10 @@ pub trait SystemProvider {
         source: URef,
         target: URef,
         amount: U512,
-    ) -> Result<(), Error>;
+    ) -> Result<(), ApiError>;
+
+    /// Records era info at the given era id.
+    fn record_era_info(&mut self, era_id: EraId, era_info: EraInfo) -> Result<(), Error>;
 }
 
 /// Provides an access to mint.
@@ -62,7 +66,7 @@ pub trait MintProvider {
         source: URef,
         target: URef,
         amount: U512,
-    ) -> Result<(), ()>;
+    ) -> Result<(), ApiError>;
 
     /// Checks balance of a `purse`. Returns `None` if given purse does not exist.
     fn balance(&mut self, purse: URef) -> Option<U512>;
@@ -73,4 +77,8 @@ pub trait MintProvider {
     /// Mints new token with given `initial_balance` balance. Returns new purse on success,
     /// otherwise an error.
     fn mint(&mut self, amount: U512) -> Result<URef, Error>;
+
+    /// Reduce total supply by `amount`. Returns unit on success, otherwise
+    /// an error.
+    fn reduce_total_supply(&mut self, amount: U512) -> Result<(), Error>;
 }

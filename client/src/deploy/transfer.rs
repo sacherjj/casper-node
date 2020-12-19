@@ -36,10 +36,10 @@ mod source_purse {
     use super::*;
 
     pub(super) const ARG_NAME: &str = "source-purse";
-    const ARG_VALUE_NAME: &str = "HEX STRING";
+    const ARG_VALUE_NAME: &str = "UREF";
     const ARG_HELP: &str =
-        "Hex-encoded URef of the source purse. If this is omitted, the main purse of the account \
-        creating this transfer will be used as the source purse";
+        "URef of the source purse. If this is omitted, the main purse of the account creating this \
+        transfer will be used as the source purse";
 
     pub(super) fn arg() -> Arg<'static, 'static> {
         Arg::with_name(ARG_NAME)
@@ -66,7 +66,7 @@ pub(super) mod target_account {
         "Hex-encoded public key of the account from which the main purse will be used as the \
         target.";
 
-    // Conflicts with --target-purse, but that's handled via an `ArgGroup` in the subcommand.  Don't
+    // Conflicts with --target-purse, but that's handled via an `ArgGroup` in the subcommand. Don't
     // add a `conflicts_with()` to the arg or the `ArgGroup` fails to work correctly.
     pub(super) fn arg() -> Arg<'static, 'static> {
         Arg::with_name(ARG_NAME)
@@ -88,8 +88,8 @@ pub(super) mod target_purse {
     use super::*;
 
     pub(super) const ARG_NAME: &str = "target-purse";
-    const ARG_VALUE_NAME: &str = "HEX STRING";
-    const ARG_HELP: &str = "Hex-encoded URef of the target purse";
+    const ARG_VALUE_NAME: &str = "UREF";
+    const ARG_HELP: &str = "URef of the target purse";
 
     // Conflicts with --target-account, but that's handled via an `ArgGroup` in the subcommand.
     // Don't add a `conflicts_with()` to the arg or the `ArgGroup` fails to work correctly.
@@ -100,6 +100,28 @@ pub(super) mod target_purse {
             .value_name(ARG_VALUE_NAME)
             .help(ARG_HELP)
             .display_order(DisplayOrder::TransferTargetPurse as usize)
+    }
+
+    pub(super) fn get<'a>(matches: &'a ArgMatches) -> &'a str {
+        matches.value_of(ARG_NAME).unwrap_or_default()
+    }
+}
+
+/// Handles providing the arg for and retrieval of the transfer id.
+pub(super) mod transfer_id {
+    use super::*;
+
+    pub(super) const ARG_NAME: &str = "transfer-id";
+    const ARG_VALUE_NAME: &str = "64-BIT INTEGER";
+    const ARG_HELP: &str = "user-defined transfer id";
+
+    pub(super) fn arg() -> Arg<'static, 'static> {
+        Arg::with_name(ARG_NAME)
+            .long(ARG_NAME)
+            .required(false)
+            .value_name(ARG_VALUE_NAME)
+            .help(ARG_HELP)
+            .display_order(DisplayOrder::TransferId as usize)
     }
 
     pub(super) fn get<'a>(matches: &'a ArgMatches) -> &'a str {
@@ -123,6 +145,7 @@ impl<'a, 'b> ClientCommand<'a, 'b> for Transfer {
             .arg(source_purse::arg())
             .arg(target_account::arg())
             .arg(target_purse::arg())
+            .arg(transfer_id::arg())
             // Group the target args to ensure exactly one is required.
             .group(
                 ArgGroup::with_name("required-target-args")
@@ -142,6 +165,7 @@ impl<'a, 'b> ClientCommand<'a, 'b> for Transfer {
         let source_purse = source_purse::get(matches);
         let target_purse = target_purse::get(matches);
         let target_account = target_account::get(matches);
+        let transfer_id = transfer_id::get(matches);
 
         let maybe_rpc_id = common::rpc_id::get(matches);
         let node_address = common::node_address::get(matches);
@@ -164,11 +188,12 @@ impl<'a, 'b> ClientCommand<'a, 'b> for Transfer {
             source_purse,
             target_purse,
             target_account,
+            transfer_id,
             DeployStrParams {
                 secret_key,
                 timestamp,
                 ttl,
-                dependencies: &dependencies,
+                dependencies,
                 gas_price,
                 chain_name,
             },

@@ -5,7 +5,7 @@
 //! initialization only happens at genesis.
 //!
 //! See
-//! https://casperlabs.atlassian.net/wiki/spaces/EN/pages/135528449/Genesis+Process+Specification
+//! <https://casperlabs.atlassian.net/wiki/spaces/EN/pages/135528449/Genesis+Process+Specification>
 //! for full details.
 
 mod chainspec;
@@ -16,6 +16,7 @@ use std::fmt::{self, Display, Formatter};
 
 use datasize::DataSize;
 use derive_more::From;
+use once_cell::sync::Lazy;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace};
@@ -23,27 +24,33 @@ use tracing::{debug, error, info, trace};
 use casper_execution_engine::core::engine_state::{self, genesis::GenesisResult};
 
 use crate::{
-    components::{storage::Storage, Component},
+    components::Component,
     crypto::hash::Digest,
     effect::{
         requests::{ChainspecLoaderRequest, ContractRuntimeRequest, StorageRequest},
         EffectBuilder, EffectExt, Effects,
     },
-    types::CryptoRngCore,
+    rpcs::docs::DocExample,
+    NodeRng,
 };
 pub use chainspec::Chainspec;
-pub(crate) use chainspec::{DeployConfig, HighwayConfig};
+pub(crate) use chainspec::{DeployConfig, HighwayConfig, UpgradePoint};
 pub use error::Error;
 
+static CHAINSPEC_INFO: Lazy<ChainspecInfo> = Lazy::new(|| ChainspecInfo {
+    name: String::from("casper-example"),
+    root_hash: Some(Digest::from([2u8; Digest::LENGTH])),
+});
+
 /// `ChainspecHandler` events.
-#[derive(Debug, From)]
+#[derive(Debug, From, Serialize)]
 pub enum Event {
     #[from]
     Request(ChainspecLoaderRequest),
     /// The result of the `ChainspecHandler` putting a `Chainspec` to the storage component.
     PutToStorage { version: Version },
     /// The result of contract runtime running the genesis process.
-    CommitGenesisResult(Result<GenesisResult, engine_state::Error>),
+    CommitGenesisResult(#[serde(skip_serializing)] Result<GenesisResult, engine_state::Error>),
 }
 
 impl Display for Event {
@@ -63,7 +70,7 @@ impl Display for Event {
     }
 }
 
-#[derive(DataSize, Debug, Serialize, Deserialize)]
+#[derive(DataSize, Debug, Serialize, Deserialize, Clone)]
 pub struct ChainspecInfo {
     // Name of the chainspec.
     name: String,
@@ -82,6 +89,12 @@ impl ChainspecInfo {
 
     pub fn root_hash(&self) -> Option<Digest> {
         self.root_hash
+    }
+}
+
+impl DocExample for ChainspecInfo {
+    fn doc_example() -> &'static Self {
+        &*CHAINSPEC_INFO
     }
 }
 
@@ -107,22 +120,22 @@ impl ChainspecLoader {
     pub(crate) fn new<REv>(
         chainspec: Chainspec,
         effect_builder: EffectBuilder<REv>,
-    ) -> Result<(Self, Effects<Event>), Error>
+    ) -> (Self, Effects<Event>)
     where
-        REv: From<Event> + From<StorageRequest<Storage>> + Send,
+        REv: From<Event> + From<StorageRequest> + Send,
     {
         let version = chainspec.genesis.protocol_version.clone();
         let effects = effect_builder
             .put_chainspec(chainspec.clone())
             .event(|_| Event::PutToStorage { version });
-        Ok((
+        (
             ChainspecLoader {
                 chainspec,
                 completed_successfully: None,
                 genesis_state_root_hash: None,
             },
             effects,
-        ))
+        )
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
@@ -144,7 +157,7 @@ impl ChainspecLoader {
 
 impl<REv> Component<REv> for ChainspecLoader
 where
-    REv: From<Event> + From<StorageRequest<Storage>> + From<ContractRuntimeRequest> + Send,
+    REv: From<Event> + From<StorageRequest> + From<ContractRuntimeRequest> + Send,
 {
     type Event = Event;
     type ConstructionError = Error;
@@ -152,7 +165,7 @@ where
     fn handle_event(
         &mut self,
         effect_builder: EffectBuilder<REv>,
-        _rng: &mut dyn CryptoRngCore,
+        _rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         match event {

@@ -1,69 +1,32 @@
 #!/usr/bin/env bash
-#
-# Renders node status to stdout.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifier.
-#   Node ordinal identifier.
 
-# Import utils.
-source $NCTL/sh/utils/misc.sh
+source $NCTL/sh/utils.sh
+source $NCTL/sh/views/funcs.sh
 
-#######################################
-# Displays to stdout current node status.
-# Globals:
-#   NCTL - path to nctl home directory.
-# Arguments:
-#   Network ordinal identifer.
-#   Node ordinal identifer.
-#######################################
-function _view_status() {
-    node_address=$(get_node_address $1 $2)
-    log "network #$1 :: node #$2 :: $node_address :: status:"
-    curl -s --header 'Content-Type: application/json' \
-        --request POST $(get_node_address_rpc $1 $2) \
-        --data-raw '{
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "info_get_status"
-        }' | jq '.result'
-}
-
-#######################################
-# Destructure input args.
-#######################################
-
-# Unset to avoid parameter collisions.
-unset net
-unset node
+unset NET_ID
+unset NODE_ID
 
 for ARGUMENT in "$@"
 do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     VALUE=$(echo $ARGUMENT | cut -f2 -d=)
     case "$KEY" in
-        net) net=${VALUE} ;;
-        node) node=${VALUE} ;;
+        net) NET_ID=${VALUE} ;;
+        node) NODE_ID=${VALUE} ;;
         *)
     esac
 done
 
-# Set defaults.
-net=${net:-1}
-node=${node:-"all"}
+NET_ID=${NET_ID:-1}
+NODE_ID=${NODE_ID:-"all"}
 
-#######################################
-# Main
-#######################################
-
-if [ $node = "all" ]; then
-    source $NCTL/assets/net-$net/vars
-    for node_idx in $(seq 1 $NCTL_NET_NODE_COUNT)
+if [ $NODE_ID = "all" ]; then
+    for NODE_ID in $(seq 1 $(get_count_of_all_nodes $NET_ID))
     do
-        _view_status $net $node_idx
         echo "------------------------------------------------------------------------------------------------------------------------------------"
+        render_node_status $NET_ID $NODE_ID
     done
+    echo "------------------------------------------------------------------------------------------------------------------------------------"
 else
-    _view_status $net $node
+    render_node_status $NET_ID $NODE_ID
 fi

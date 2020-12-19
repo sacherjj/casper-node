@@ -1,5 +1,8 @@
 //! Asymmetric-key types and functions.
 
+// TODO - remove once schemars stops causing warning.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::{
     cmp::Ordering,
     convert::TryFrom,
@@ -17,9 +20,11 @@ use hex_fmt::HexFmt;
 use k256::ecdsa::{
     Signature as Secp256k1Signature, Signer as Secp256k1Signer, Verifier as Secp256k1Verifier,
 };
+use once_cell::sync::Lazy;
 use pem::Pem;
 #[cfg(test)]
 use rand::{Rng, RngCore};
+use schemars::{gen, schema::Schema, JsonSchema};
 use serde::{
     de::{Deserializer, Error as SerdeError},
     Deserialize, Serialize, Serializer,
@@ -30,13 +35,14 @@ use untrusted::Input;
 
 use casper_types::bytesrepr::{self, FromBytes, ToBytes, U8_SERIALIZED_LENGTH};
 
-use super::{Error, Result};
+pub use super::{Error, Result};
 #[cfg(test)]
 use crate::testing::TestRng;
 use crate::{
     crypto::hash::hash,
-    types::CryptoRngCore,
+    rpcs::docs::DocExample,
     utils::{read_file, write_file},
+    NodeRng,
 };
 use casper_types::account::AccountHash;
 
@@ -61,6 +67,11 @@ const EC_PUBLIC_KEY_OBJECT_IDENTIFIER: [u8; 7] = [42, 134, 72, 206, 61, 2, 1];
 const SECP256K1_OBJECT_IDENTIFIER: [u8; 5] = [43, 129, 4, 0, 10];
 const SECP256K1_PEM_SECRET_KEY_TAG: &str = "EC PRIVATE KEY";
 const SECP256K1_PEM_PUBLIC_KEY_TAG: &str = "PUBLIC KEY";
+
+static ED25519_KEY: Lazy<SecretKey> = Lazy::new(|| {
+    let bytes = [15u8; SecretKey::ED25519_LENGTH];
+    SecretKey::new_ed25519(bytes)
+});
 
 /// A secret or private asymmetric key.
 #[derive(DataSize)]
@@ -372,6 +383,12 @@ impl Debug for SecretKey {
             SecretKey::Ed25519(_) => write!(formatter, "SecretKey::{}(...)", ED25519),
             SecretKey::Secp256k1(_) => write!(formatter, "SecretKey::{}(...)", SECP256K1),
         }
+    }
+}
+
+impl DocExample for SecretKey {
+    fn doc_example() -> &'static Self {
+        &*ED25519_KEY
     }
 }
 
@@ -739,24 +756,23 @@ impl ToBytes for PublicKey {
         match self {
             PublicKey::Ed25519(public_key) => {
                 buffer.insert(0, ED25519_TAG);
-                buffer.extend(public_key.as_ref().to_vec().into_bytes()?);
+                let ed25519_bytes = public_key.as_bytes();
+                buffer.extend_from_slice(ed25519_bytes);
             }
             PublicKey::Secp256k1(public_key) => {
                 buffer.insert(0, SECP256K1_TAG);
-                buffer.extend(public_key.as_ref().to_vec().into_bytes()?);
+                let secp256k1_bytes = public_key.as_bytes();
+                buffer.extend_from_slice(secp256k1_bytes);
             }
         }
         Ok(buffer)
     }
 
-    // TODO: implement ToBytes for `&[u8]` to avoid allocating via `to_vec()` here.
     fn serialized_length(&self) -> usize {
         TAG_LENGTH
             + match self {
-                PublicKey::Ed25519(public_key) => public_key.as_ref().to_vec().serialized_length(),
-                PublicKey::Secp256k1(public_key) => {
-                    public_key.as_ref().to_vec().serialized_length()
-                }
+                PublicKey::Ed25519(_) => Self::ED25519_LENGTH,
+                PublicKey::Secp256k1(_) => Self::SECP256K1_LENGTH,
             }
     }
 }
@@ -766,16 +782,18 @@ impl FromBytes for PublicKey {
         let (tag, remainder) = u8::from_bytes(bytes)?;
         match tag {
             ED25519_TAG => {
-                let (raw_bytes, remainder) = Vec::<u8>::from_bytes(remainder)?;
-                let public_key = Self::ed25519_from_bytes(&raw_bytes).map_err(|error| {
+                let (raw_bytes, remainder): ([u8; Self::ED25519_LENGTH], _) =
+                    FromBytes::from_bytes(remainder)?;
+                let public_key = Self::new_ed25519(raw_bytes).map_err(|error| {
                     info!("failed deserializing to public key: {}", error);
                     bytesrepr::Error::Formatting
                 })?;
                 Ok((public_key, remainder))
             }
             SECP256K1_TAG => {
-                let (raw_bytes, remainder) = Vec::<u8>::from_bytes(remainder)?;
-                let public_key = Self::secp256k1_from_bytes(&raw_bytes).map_err(|error| {
+                let (raw_bytes, remainder): ([u8; Self::SECP256K1_LENGTH], _) =
+                    FromBytes::from_bytes(remainder)?;
+                let public_key = Self::new_secp256k1(raw_bytes).map_err(|error| {
                     info!("failed deserializing to public key: {}", error);
                     bytesrepr::Error::Formatting
                 })?;
@@ -786,6 +804,21 @@ impl FromBytes for PublicKey {
                 Err(bytesrepr::Error::Formatting)
             }
         }
+    }
+}
+
+impl JsonSchema for PublicKey {
+    fn schema_name() -> String {
+        String::from("PublicKey")
+    }
+
+    fn json_schema(gen: &mut gen::SchemaGenerator) -> Schema {
+        let schema = gen.subschema_for::<String>();
+        let mut schema_object = schema.into_object();
+        schema_object.metadata().description = Some(
+            "Hex-encoded cryptographic public key, including the algorithm tag prefix.".to_string(),
+        );
+        schema_object.into()
     }
 }
 
@@ -988,6 +1021,63 @@ impl Display for Signature {
     }
 }
 
+impl ToBytes for Signature {
+    fn to_bytes(&self) -> StdResult<Vec<u8>, bytesrepr::Error> {
+        let mut buffer = bytesrepr::allocate_buffer(self)?;
+        match self {
+            Signature::Ed25519(signature) => {
+                buffer.insert(0, ED25519_TAG);
+                buffer.extend(signature.to_bytes()?);
+            }
+            Signature::Secp256k1(signature) => {
+                buffer.insert(0, SECP256K1_TAG);
+                buffer.extend_from_slice(signature.as_ref());
+            }
+        }
+        Ok(buffer)
+    }
+
+    fn serialized_length(&self) -> usize {
+        TAG_LENGTH
+            + match self {
+                Signature::Ed25519(_) => Self::ED25519_LENGTH,
+                Signature::Secp256k1(_) => Self::SECP256K1_LENGTH,
+            }
+    }
+}
+
+impl FromBytes for Signature {
+    fn from_bytes(bytes: &[u8]) -> StdResult<(Self, &[u8]), bytesrepr::Error> {
+        let (tag, remainder) = u8::from_bytes(bytes)?;
+        match tag {
+            ED25519_TAG => {
+                let (ed25519_signature_bytes, remainder) =
+                    <[u8; ed25519::SIGNATURE_LENGTH]>::from_bytes(remainder)?;
+                let ed25519_signature =
+                    Self::new_ed25519(ed25519_signature_bytes).map_err(|error| {
+                        info!("failed to deserialize ed25519 signature:{}", error);
+                        bytesrepr::Error::Formatting
+                    })?;
+                Ok((ed25519_signature, remainder))
+            }
+            SECP256K1_TAG => {
+                let (secp256k1_signature_bytes, remainder): ([u8; Self::SECP256K1_LENGTH], &[u8]) =
+                    FromBytes::from_bytes(remainder)?;
+                let secp256k1_signature =
+                    Self::new_secp256k1(secp256k1_signature_bytes).map_err(|error| {
+                        info!("failed to deserialize secp256k1 signature: {}", error);
+                        bytesrepr::Error::Formatting
+                    })?;
+                Ok((secp256k1_signature, remainder))
+            }
+            _ => {
+                info!("failed to deserialize to signature: invalid tag: {}", tag);
+                Err(bytesrepr::Error::Formatting)
+            }
+        }
+    }
+}
+
 impl Serialize for Signature {
     fn serialize<S: Serializer>(&self, serializer: S) -> StdResult<S::Ok, S::Error> {
         serialize(self, serializer)
@@ -997,6 +1087,21 @@ impl Serialize for Signature {
 impl<'de> Deserialize<'de> for Signature {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> StdResult<Self, D::Error> {
         deserialize(deserializer)
+    }
+}
+
+impl JsonSchema for Signature {
+    fn schema_name() -> String {
+        String::from("Signature")
+    }
+
+    fn json_schema(gen: &mut gen::SchemaGenerator) -> Schema {
+        let schema = gen.subschema_for::<String>();
+        let mut schema_object = schema.into_object();
+        schema_object.metadata().description = Some(
+            "Hex-encoded cryptographic signature, including the algorithm tag prefix.".to_string(),
+        );
+        schema_object.into()
     }
 }
 
@@ -1178,7 +1283,7 @@ pub fn sign<T: AsRef<[u8]>>(
     message: T,
     secret_key: &SecretKey,
     public_key: &PublicKey,
-    rng: &mut dyn CryptoRngCore,
+    rng: &mut NodeRng,
 ) -> Signature {
     match (secret_key, public_key) {
         (SecretKey::Ed25519(secret_key), PublicKey::Ed25519(public_key)) => {
@@ -1383,6 +1488,12 @@ mod tests {
         let deserialized = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(signature, deserialized);
         assert_eq!(signature.tag(), deserialized.tag());
+
+        // Try to/from using bytesrepr.
+        let serialized = bytesrepr::serialize(signature).unwrap();
+        let deserialized = bytesrepr::deserialize(serialized).unwrap();
+        assert_eq!(signature, deserialized);
+        assert_eq!(signature.tag(), deserialized.tag())
     }
 
     fn signature_hex_roundtrip(signature: Signature) {
@@ -1427,7 +1538,7 @@ mod tests {
 
         #[test]
         fn secret_key_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             super::secret_key_serialization_roundtrip(secret_key)
         }
@@ -1445,7 +1556,7 @@ mod tests {
 
         #[test]
         fn secret_key_to_and_from_der() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             let der_encoded = secret_key.to_der().unwrap();
             secret_key_der_roundtrip(secret_key);
@@ -1456,7 +1567,7 @@ mod tests {
 
         #[test]
         fn secret_key_to_and_from_pem() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             secret_key_pem_roundtrip(secret_key);
         }
@@ -1474,14 +1585,14 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
 
         #[test]
         fn secret_key_to_and_from_file() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             secret_key_file_roundtrip(secret_key);
         }
 
         #[test]
         fn public_key_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             super::public_key_serialization_roundtrip(public_key);
         }
@@ -1490,7 +1601,7 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
         fn public_key_from_bytes() {
             // Public key should be `PublicKey::ED25519_LENGTH` bytes.  Create vec with an extra
             // byte.
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             let bytes: Vec<u8> = iter::once(rng.gen())
                 .chain(public_key.as_ref().iter().copied())
@@ -1505,14 +1616,14 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
 
         #[test]
         fn public_key_to_and_from_der() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             public_key_der_roundtrip(public_key);
         }
 
         #[test]
         fn public_key_to_and_from_pem() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             public_key_pem_roundtrip(public_key);
         }
@@ -1530,21 +1641,21 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn public_key_to_and_from_file() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             public_key_file_roundtrip(public_key);
         }
 
         #[test]
         fn public_key_to_and_from_hex() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_ed25519(&mut rng);
             public_key_hex_roundtrip(public_key);
         }
 
         #[test]
         fn signature_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             let public_key = PublicKey::from(&secret_key);
             let data = b"data";
@@ -1569,7 +1680,7 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn signature_key_to_and_from_hex() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
             let public_key = PublicKey::from(&secret_key);
             let data = b"data";
@@ -1602,7 +1713,7 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn sign_and_verify() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
 
             let public_key = PublicKey::from(&secret_key);
@@ -1620,7 +1731,7 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn account_hash_generation_is_consistent() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_ed25519(&mut rng);
 
             let public_key_node = PublicKey::from(&secret_key);
@@ -1629,6 +1740,16 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
             let hash_node: AccountHash = public_key_node.to_account_hash();
             let hash_types: AccountHash = public_key_types.into();
             assert_eq!(hash_types, hash_node)
+        }
+
+        #[test]
+        fn bytesrepr_roundtrip_signature() {
+            let mut rng = TestRng::new();
+            let ed25519_secret_key = SecretKey::random_ed25519(&mut rng);
+            let public_key = PublicKey::from(&ed25519_secret_key);
+            let data = b"data";
+            let signature = sign(data, &ed25519_secret_key, &public_key, &mut rng);
+            bytesrepr::test_serialization_roundtrip(&signature);
         }
     }
 
@@ -1640,7 +1761,7 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn secret_key_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             super::secret_key_serialization_roundtrip(secret_key)
         }
@@ -1658,14 +1779,14 @@ MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
 
         #[test]
         fn secret_key_to_and_from_der() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             secret_key_der_roundtrip(secret_key);
         }
 
         #[test]
         fn secret_key_to_and_from_pem() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             secret_key_pem_roundtrip(secret_key);
         }
@@ -1685,14 +1806,14 @@ Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn secret_key_to_and_from_file() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             secret_key_file_roundtrip(secret_key);
         }
 
         #[test]
         fn public_key_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             super::public_key_serialization_roundtrip(public_key);
         }
@@ -1701,7 +1822,7 @@ Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
         fn public_key_from_bytes() {
             // Public key should be `PublicKey::SECP256K1_LENGTH` bytes.  Create vec with an extra
             // byte.
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             let bytes: Vec<u8> = iter::once(rng.gen())
                 .chain(public_key.as_ref().iter().copied())
@@ -1716,14 +1837,14 @@ Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn public_key_to_and_from_der() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             public_key_der_roundtrip(public_key);
         }
 
         #[test]
         fn public_key_to_and_from_pem() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             public_key_pem_roundtrip(public_key);
         }
@@ -1742,26 +1863,36 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn public_key_to_and_from_file() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             public_key_file_roundtrip(public_key);
         }
 
         #[test]
         fn public_key_to_and_from_hex() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             public_key_hex_roundtrip(public_key);
         }
 
         #[test]
         fn signature_serialization_roundtrip() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             let public_key = PublicKey::from(&secret_key);
             let data = b"data";
             let signature = sign(data, &secret_key, &public_key, &mut rng);
             super::signature_serialization_roundtrip(signature);
+        }
+
+        #[test]
+        fn bytesrepr_roundtrip_signature() {
+            let mut rng = TestRng::new();
+            let secret_key = SecretKey::random_secp256k1(&mut rng);
+            let public_key = PublicKey::from(&secret_key);
+            let data = b"data";
+            let signature = sign(data, &secret_key, &public_key, &mut rng);
+            bytesrepr::test_serialization_roundtrip(&signature);
         }
 
         #[test]
@@ -1777,7 +1908,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn signature_key_to_and_from_hex() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
             let public_key = PublicKey::from(&secret_key);
             let data = b"data";
@@ -1787,7 +1918,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn public_key_traits() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key1 = PublicKey::random_secp256k1(&mut rng);
             let public_key2 = PublicKey::random_secp256k1(&mut rng);
             if public_key1.as_ref() < public_key2.as_ref() {
@@ -1799,7 +1930,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn public_key_to_account_hash() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let public_key = PublicKey::random_secp256k1(&mut rng);
             assert_ne!(public_key.to_account_hash().as_ref(), public_key.as_ref());
         }
@@ -1813,7 +1944,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
         #[test]
         fn account_hash_generation_is_consistent() {
-            let mut rng = TestRng::new();
+            let mut rng = crate::new_rng();
             let secret_key = SecretKey::random_secp256k1(&mut rng);
 
             let public_key_node = PublicKey::from(&secret_key);
@@ -1827,7 +1958,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
     #[test]
     fn public_key_traits() {
-        let mut rng = TestRng::new();
+        let mut rng = crate::new_rng();
         let ed25519_public_key = PublicKey::random_ed25519(&mut rng);
         let secp256k1_public_key = PublicKey::random_secp256k1(&mut rng);
         check_ord_and_hash(ed25519_public_key, secp256k1_public_key);
@@ -1842,7 +1973,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
     #[test]
     fn sign_and_verify() {
-        let mut rng = TestRng::new();
+        let mut rng = crate::new_rng();
         let ed25519_secret_key = SecretKey::random_ed25519(&mut rng);
         let secp256k1_secret_key = SecretKey::random_secp256k1(&mut rng);
 
@@ -1876,7 +2007,7 @@ kv+kBR5u4ISEAkuc2TFWQHX0Yj9oTB9fx9+vvQdxJOhMtu46kGo0Uw==
 
     #[test]
     fn should_construct_secp256k1_from_uncompressed_bytes() {
-        let mut rng = TestRng::new();
+        let mut rng = crate::new_rng();
 
         // Construct a secp256k1 secret key and use that to construct an uncompressed public key.
         let secp256k1_secret_key = {

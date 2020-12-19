@@ -4,8 +4,13 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 
 use casper_types::{
-    account::AccountHash, api_error, bytesrepr, ApiError, ContractHash, SystemContractType,
-    TransferResult, TransferredTo, URef, U512, UREF_SERIALIZED_LENGTH,
+    account::AccountHash,
+    api_error,
+    auction::{EraId, EraInfo},
+    bytesrepr,
+    system_contract_errors::auction,
+    ApiError, ContractHash, SystemContractType, TransferResult, TransferredTo, URef, U512,
+    UREF_SERIALIZED_LENGTH,
 };
 
 use crate::{
@@ -20,7 +25,7 @@ fn get_system_contract(system_contract: SystemContractType) -> ContractHash {
         let result = {
             let mut hash_data_raw = ContractHash::default();
             let value = unsafe {
-                ext_ffi::get_system_contract(
+                ext_ffi::casper_get_system_contract(
                     system_contract_index,
                     hash_data_raw.as_mut_ptr(),
                     hash_data_raw.len(),
@@ -68,7 +73,7 @@ pub fn get_auction() -> ContractHash {
 pub fn create_purse() -> URef {
     let purse_non_null_ptr = contract_api::alloc_bytes(UREF_SERIALIZED_LENGTH);
     unsafe {
-        let ret = ext_ffi::create_purse(purse_non_null_ptr.as_ptr(), UREF_SERIALIZED_LENGTH);
+        let ret = ext_ffi::casper_create_purse(purse_non_null_ptr.as_ptr(), UREF_SERIALIZED_LENGTH);
         if ret == 0 {
             let bytes = Vec::from_raw_parts(
                 purse_non_null_ptr.as_ptr(),
@@ -88,7 +93,8 @@ pub fn get_balance(purse: URef) -> Option<U512> {
 
     let value_size = {
         let mut output_size = MaybeUninit::uninit();
-        let ret = unsafe { ext_ffi::get_balance(purse_ptr, purse_size, output_size.as_mut_ptr()) };
+        let ret =
+            unsafe { ext_ffi::casper_get_balance(purse_ptr, purse_size, output_size.as_mut_ptr()) };
         match api_error::result_from(ret) {
             Ok(_) => unsafe { output_size.assume_init() },
             Err(ApiError::InvalidPurse) => return None,
@@ -102,12 +108,30 @@ pub fn get_balance(purse: URef) -> Option<U512> {
 
 /// Transfers `amount` of motes from the default purse of the account to `target`
 /// account.  If `target` does not exist it will be created.
-pub fn transfer_to_account(target: AccountHash, amount: U512) -> TransferResult {
+pub fn transfer_to_account(target: AccountHash, amount: U512, id: Option<u64>) -> TransferResult {
     let (target_ptr, target_size, _bytes1) = contract_api::to_ptr(target);
     let (amount_ptr, amount_size, _bytes2) = contract_api::to_ptr(amount);
-    let return_code =
-        unsafe { ext_ffi::transfer_to_account(target_ptr, target_size, amount_ptr, amount_size) };
-    TransferredTo::result_from(return_code)
+    let (id_ptr, id_size, _bytes3) = contract_api::to_ptr(id);
+    let mut maybe_result_value = MaybeUninit::uninit();
+
+    let return_code = unsafe {
+        ext_ffi::casper_transfer_to_account(
+            target_ptr,
+            target_size,
+            amount_ptr,
+            amount_size,
+            id_ptr,
+            id_size,
+            maybe_result_value.as_mut_ptr(),
+        )
+    };
+
+    // Propagate error (if any)
+    api_error::result_from(return_code)?;
+
+    // Return appropriate result if transfer was successful
+    let transferred_to_value = unsafe { maybe_result_value.assume_init() };
+    TransferredTo::result_from(transferred_to_value)
 }
 
 /// Transfers `amount` of motes from `source` purse to `target` account.  If `target` does not exist
@@ -116,21 +140,34 @@ pub fn transfer_from_purse_to_account(
     source: URef,
     target: AccountHash,
     amount: U512,
+    id: Option<u64>,
 ) -> TransferResult {
     let (source_ptr, source_size, _bytes1) = contract_api::to_ptr(source);
     let (target_ptr, target_size, _bytes2) = contract_api::to_ptr(target);
     let (amount_ptr, amount_size, _bytes3) = contract_api::to_ptr(amount);
+    let (id_ptr, id_size, _bytes4) = contract_api::to_ptr(id);
+
+    let mut maybe_result_value = MaybeUninit::uninit();
     let return_code = unsafe {
-        ext_ffi::transfer_from_purse_to_account(
+        ext_ffi::casper_transfer_from_purse_to_account(
             source_ptr,
             source_size,
             target_ptr,
             target_size,
             amount_ptr,
             amount_size,
+            id_ptr,
+            id_size,
+            maybe_result_value.as_mut_ptr(),
         )
     };
-    TransferredTo::result_from(return_code)
+
+    // Propagate error (if any)
+    api_error::result_from(return_code)?;
+
+    // Return appropriate result if transfer was successful
+    let transferred_to_value = unsafe { maybe_result_value.assume_init() };
+    TransferredTo::result_from(transferred_to_value)
 }
 
 /// Transfers `amount` of motes from `source` purse to `target` purse.  If `target` does not exist
@@ -139,18 +176,54 @@ pub fn transfer_from_purse_to_purse(
     source: URef,
     target: URef,
     amount: U512,
+    id: Option<u64>,
 ) -> Result<(), ApiError> {
     let (source_ptr, source_size, _bytes1) = contract_api::to_ptr(source);
     let (target_ptr, target_size, _bytes2) = contract_api::to_ptr(target);
     let (amount_ptr, amount_size, _bytes3) = contract_api::to_ptr(amount);
+    let (id_ptr, id_size, _bytes4) = contract_api::to_ptr(id);
     let result = unsafe {
-        ext_ffi::transfer_from_purse_to_purse(
+        ext_ffi::casper_transfer_from_purse_to_purse(
             source_ptr,
             source_size,
             target_ptr,
             target_size,
             amount_ptr,
             amount_size,
+            id_ptr,
+            id_size,
+        )
+    };
+    api_error::result_from(result)
+}
+
+/// Records a transfer.  Can only be called from within the mint contract.
+/// Needed to support system contract-based execution.
+#[doc(hidden)]
+pub fn record_transfer(
+    maybe_to: Option<AccountHash>,
+    source: URef,
+    target: URef,
+    amount: U512,
+    id: Option<u64>,
+) -> Result<(), ApiError> {
+    let (maybe_to_ptr, maybe_to_size, _bytes1) = contract_api::to_ptr(maybe_to);
+    let (source_ptr, source_size, _bytes2) = contract_api::to_ptr(source);
+    let (target_ptr, target_size, _bytes3) = contract_api::to_ptr(target);
+    let (amount_ptr, amount_size, _bytes4) = contract_api::to_ptr(amount);
+    let (id_ptr, id_size, _bytes5) = contract_api::to_ptr(id);
+    let result = unsafe {
+        ext_ffi::casper_record_transfer(
+            maybe_to_ptr,
+            maybe_to_size,
+            source_ptr,
+            source_size,
+            target_ptr,
+            target_size,
+            amount_ptr,
+            amount_size,
+            id_ptr,
+            id_size,
         )
     };
     if result == 0 {
@@ -160,26 +233,18 @@ pub fn transfer_from_purse_to_purse(
     }
 }
 
-/// Records a transfer.  Can only be called from within the mint contract.
+/// Records era info.  Can only be called from within the auction contract.
 /// Needed to support system contract-based execution.
 #[doc(hidden)]
-pub fn record_transfer(source: URef, target: URef, amount: U512) -> Result<(), ApiError> {
-    let (source_ptr, source_size, _bytes1) = contract_api::to_ptr(source);
-    let (target_ptr, target_size, _bytes2) = contract_api::to_ptr(target);
-    let (amount_ptr, amount_size, _bytes3) = contract_api::to_ptr(amount);
+pub fn record_era_info(era_id: EraId, era_info: EraInfo) -> Result<(), ApiError> {
+    let (era_id_ptr, era_id_size, _bytes1) = contract_api::to_ptr(era_id);
+    let (era_info_ptr, era_info_size, _bytes2) = contract_api::to_ptr(era_info);
     let result = unsafe {
-        ext_ffi::record_transfer(
-            source_ptr,
-            source_size,
-            target_ptr,
-            target_size,
-            amount_ptr,
-            amount_size,
-        )
+        ext_ffi::casper_record_era_info(era_id_ptr, era_id_size, era_info_ptr, era_info_size)
     };
     if result == 0 {
         Ok(())
     } else {
-        Err(ApiError::Transfer)
+        Err(auction::Error::RecordEraInfo.into())
     }
 }

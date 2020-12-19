@@ -8,17 +8,21 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
+use casper_types::ExecutionResult;
+use serde::Serialize;
+
 use crate::{
-    components::small_network::GossipedAddress,
+    components::{consensus::EraId, small_network::GossipedAddress},
+    crypto::asymmetric_key::PublicKey,
     types::{
-        json_compatibility::ExecutionResult, Block, BlockHash, BlockHeader, Deploy, DeployHash,
-        DeployHeader, FinalizedBlock, Item, ProtoBlock,
+        Block, BlockHash, BlockHeader, Deploy, DeployHash, DeployHeader, FinalitySignature,
+        FinalizedBlock, Item, Timestamp,
     },
     utils::Source,
 };
 
 /// A networking layer announcement.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 #[must_use]
 pub enum NetworkAnnouncement<I, P> {
     /// A payload message has been received from a peer.
@@ -56,10 +60,10 @@ where
     }
 }
 
-/// An HTTP API server announcement.
-#[derive(Debug)]
+/// An RPC API server announcement.
+#[derive(Debug, Serialize)]
 #[must_use]
-pub enum ApiServerAnnouncement {
+pub enum RpcServerAnnouncement {
     /// A new deploy received.
     DeployReceived {
         /// The received deploy.
@@ -67,10 +71,10 @@ pub enum ApiServerAnnouncement {
     },
 }
 
-impl Display for ApiServerAnnouncement {
+impl Display for RpcServerAnnouncement {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            ApiServerAnnouncement::DeployReceived { deploy } => {
+            RpcServerAnnouncement::DeployReceived { deploy } => {
                 write!(formatter, "api server received {}", deploy.id())
             }
         }
@@ -78,7 +82,7 @@ impl Display for ApiServerAnnouncement {
 }
 
 /// A `DeployAcceptor` announcement.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum DeployAcceptorAnnouncement<I> {
     /// A deploy which wasn't previously stored on this node has been accepted and stored.
     AcceptedNewDeploy {
@@ -115,28 +119,32 @@ impl<I: Display> Display for DeployAcceptorAnnouncement<I> {
 
 /// A consensus announcement.
 #[derive(Debug)]
-pub enum ConsensusAnnouncement {
-    /// A block was proposed and will either be finalized or orphaned soon.
-    Proposed(ProtoBlock),
+pub enum ConsensusAnnouncement<I> {
     /// A block was finalized.
     Finalized(Box<FinalizedBlock>),
-    /// A block was orphaned.
-    Orphaned(ProtoBlock),
     /// A linear chain block has been handled.
     Handled(Box<BlockHeader>),
+    /// An equivocation has been detected.
+    Fault {
+        /// The Id of the era in which the equivocation was detected
+        era_id: EraId,
+        /// The public key of the equivocator.
+        public_key: Box<PublicKey>,
+        /// The timestamp when the evidence of the equivocation was detected.
+        timestamp: Timestamp,
+    },
+    /// We want to disconnect from a peer due to its transgressions.
+    DisconnectFromPeer(I),
 }
 
-impl Display for ConsensusAnnouncement {
+impl<I> Display for ConsensusAnnouncement<I>
+where
+    I: Display,
+{
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            ConsensusAnnouncement::Proposed(block) => {
-                write!(formatter, "proposed proto block {}", block)
-            }
             ConsensusAnnouncement::Finalized(block) => {
                 write!(formatter, "finalized proto block {}", block)
-            }
-            ConsensusAnnouncement::Orphaned(block) => {
-                write!(formatter, "orphaned proto block {}", block)
             }
             ConsensusAnnouncement::Handled(block_header) => write!(
                 formatter,
@@ -144,6 +152,18 @@ impl Display for ConsensusAnnouncement {
                 block_header.height(),
                 block_header.hash()
             ),
+            ConsensusAnnouncement::Fault {
+                era_id,
+                public_key,
+                timestamp,
+            } => write!(
+                formatter,
+                "Validator fault with public key: {} has been identified at time: {} in era: {}",
+                public_key, timestamp, era_id,
+            ),
+            ConsensusAnnouncement::DisconnectFromPeer(peer) => {
+                write!(formatter, "Consensus wanting to disconnect from {}", peer)
+            }
         }
     }
 }
@@ -195,6 +215,8 @@ pub enum LinearChainAnnouncement {
         /// Block header.
         block_header: Box<BlockHeader>,
     },
+    /// New finality signature received.
+    NewFinalitySignature(Box<FinalitySignature>),
 }
 
 impl Display for LinearChainAnnouncement {
@@ -202,6 +224,9 @@ impl Display for LinearChainAnnouncement {
         match self {
             LinearChainAnnouncement::BlockAdded { block_hash, .. } => {
                 write!(f, "block added {}", block_hash)
+            }
+            LinearChainAnnouncement::NewFinalitySignature(fs) => {
+                write!(f, "new finality signature {}", fs.block_hash)
             }
         }
     }

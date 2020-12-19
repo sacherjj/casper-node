@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, iter::Sum};
 
 use num::Zero;
 
@@ -88,8 +88,21 @@ impl Zero for Gas {
     }
 }
 
+impl Sum for Gas {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Gas::zero(), std::ops::Add::add)
+    }
+}
+
 impl From<u32> for Gas {
     fn from(gas: u32) -> Self {
+        let gas_u512: U512 = gas.into();
+        Gas::new(gas_u512)
+    }
+}
+
+impl From<u64> for Gas {
+    fn from(gas: u64) -> Self {
         let gas_u512: U512 = gas.into();
         Gas::new(gas_u512)
     }

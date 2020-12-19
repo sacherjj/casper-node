@@ -3,14 +3,16 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
+use serde::Serialize;
+
 use super::{Item, Message};
 use crate::{
-    components::small_network::NodeId,
+    types::NodeId,
     utils::{DisplayIter, Source},
 };
 
 /// `Gossiper` events.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum Event<T: Item> {
     /// A new item has been received to be gossiped.
     ItemReceived {
@@ -20,6 +22,7 @@ pub enum Event<T: Item> {
     /// The network component gossiped to the included peers.
     GossipedTo {
         item_id: T::Id,
+        requested_count: usize,
         peers: HashSet<NodeId>,
     },
     /// The timeout for waiting for a gossip response has elapsed and we should check the response
@@ -45,7 +48,7 @@ impl<T: Item> Display for Event<T> {
             Event::ItemReceived { item_id, source } => {
                 write!(formatter, "new item {} received from {}", item_id, source)
             }
-            Event::GossipedTo { item_id, peers } => write!(
+            Event::GossipedTo { item_id, peers, .. } => write!(
                 formatter,
                 "gossiped {} to {}",
                 item_id,

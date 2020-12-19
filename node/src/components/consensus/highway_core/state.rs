@@ -2,31 +2,39 @@ mod block;
 mod panorama;
 mod params;
 mod tallies;
-mod vote;
+mod unit;
 mod weight;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 pub(crate) use params::Params;
+use quanta::Clock;
 pub(crate) use weight::Weight;
 
-pub(super) use panorama::{Observation, Panorama};
-pub(super) use vote::Vote;
+pub(crate) use panorama::{Observation, Panorama};
+pub(super) use unit::Unit;
 
-use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, convert::identity, iter};
+use std::{
+    borrow::Borrow,
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    convert::identity,
+    iter,
+};
 
 use itertools::Itertools;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     components::consensus::{
         highway_core::{
+            endorsement::{Endorsement, SignedEndorsement},
             evidence::Evidence,
-            highway::{SignedWireVote, WireVote},
+            highway::{Endorsements, SignedWireUnit, WireUnit},
             validators::{ValidatorIndex, ValidatorMap},
         },
         traits::Context,
@@ -37,43 +45,55 @@ use crate::{
 use block::Block;
 use tallies::Tallies;
 
-use super::endorsement::{Endorsement, Endorsements};
-
-#[derive(Debug, Error, PartialEq)]
-pub(crate) enum VoteError {
-    #[error("The vote is a ballot but doesn't cite any block.")]
+#[derive(Debug, Error, PartialEq, Clone)]
+pub(crate) enum UnitError {
+    #[error("The unit is a ballot but doesn't cite any block.")]
     MissingBlock,
     #[error("The panorama's length {} doesn't match the number of validators.", _0)]
     PanoramaLength(usize),
-    #[error("The vote accuses its own creator as faulty.")]
+    #[error("The unit accuses its own creator as faulty.")]
     FaultyCreator,
-    #[error("The panorama has a vote from {:?} in the slot for {:?}.", _0, _1)]
+    #[error("The panorama has a unit from {:?} in the slot for {:?}.", _0, _1)]
     PanoramaIndex(ValidatorIndex, ValidatorIndex),
-    #[error("The panorama is missing votes indirectly cited via {:?}.", _0)]
+    #[error("The panorama is missing units indirectly cited via {:?}.", _0)]
     InconsistentPanorama(ValidatorIndex),
-    #[error("The vote contains the wrong sequence number.")]
+    #[error("The unit contains the wrong sequence number.")]
     SequenceNumber,
-    #[error("The vote's timestamp is older than a justification's.")]
+    #[error("The unit's timestamp is older than a justification's.")]
     Timestamps,
     #[error("The creator is not a validator.")]
     Creator,
-    #[error("The vote was created for a wrong instance ID.")]
+    #[error("The unit was created for a wrong instance ID.")]
     InstanceId,
     #[error("The signature is invalid.")]
     Signature,
-    #[error("The round length is invalid.")]
-    RoundLength,
-    #[error("This would be the third vote in that round. Only two are allowed.")]
-    ThreeVotesInRound,
+    #[error("The round length exponent has somehow changed within a round.")]
+    RoundLengthExpChangedWithinRound,
+    #[error("The round length exponent is less than the minimum allowed by the chain-spec.")]
+    RoundLengthExpLessThanMinimum,
+    #[error("The round length exponent is greater than the maximum allowed by the chain-spec.")]
+    RoundLengthExpGreaterThanMaximum,
+    #[error("This would be the third unit in that round. Only two are allowed.")]
+    ThreeUnitsInRound,
     #[error(
-        "A block must be the leader's ({:?}) first vote, at the beginning of the round.",
+        "A block must be the leader's ({:?}) first unit, at the beginning of the round.",
         _0
     )]
     NonLeaderBlock(ValidatorIndex),
-    #[error("The vote is a block, but its parent is already a terminal block.")]
+    #[error("The unit is a block, but its parent is already a terminal block.")]
     ValueAfterTerminalBlock,
-    #[error("The vote's creator is banned.")]
+    #[error("The unit's creator is banned.")]
     Banned,
+    #[error("The unit's endorsed units were not a superset of its justifications.")]
+    EndorsementsNotMonotonic,
+    #[error("The LNC rule was violated. Vote cited ({:?}) naively.", _0)]
+    LncNaiveCitation(ValidatorIndex),
+    #[error(
+        "Wire unit endorses hash but does not see it. Hash: {:?}; Wire unit: {:?}",
+        hash,
+        wire_unit
+    )]
+    EndorsedButUnseen { hash: String, wire_unit: String },
 }
 
 /// A reason for a validator to be marked as faulty.
@@ -81,7 +101,7 @@ pub(crate) enum VoteError {
 /// The `Banned` state is fixed from the beginning and can't be replaced. However, `Indirect` can
 /// be replaced with `Direct` evidence, which has the same effect but doesn't rely on information
 /// from other consensus protocol instances.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum Fault<C: Context> {
     /// The validator was known to be faulty from the beginning. All their messages are considered
     /// invalid in this Highway instance.
@@ -106,7 +126,7 @@ impl<C: Context> Fault<C> {
 /// Both observers and active validators must instantiate this, pass in all incoming vertices from
 /// peers, and use a [FinalityDetector](../finality_detector/struct.FinalityDetector.html) to
 /// determine the outcome of the consensus process.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct State<C: Context> {
     /// The fixed parameters.
     params: Params,
@@ -115,19 +135,29 @@ pub(crate) struct State<C: Context> {
     /// Cumulative validator weights: Entry `i` contains the sum of the weights of validators `0`
     /// through `i`.
     cumulative_w: ValidatorMap<Weight>,
-    /// All votes imported so far, by hash.
-    // TODO: HashMaps prevent deterministic tests.
-    votes: HashMap<C::Hash, Vote<C>>,
-    /// All blocks, by hash.
+    /// All units imported so far, by hash.
+    /// This is a downward closed set: A unit must only be added here once all of its dependencies
+    /// have been added as well, and it has been fully validated.
+    units: HashMap<C::Hash, Unit<C>>,
+    /// All blocks, by hash. All block hashes are also unit hashes, but units that did not
+    /// introduce a new block don't have their own entry here.
     blocks: HashMap<C::Hash, Block<C>>,
     /// List of faulty validators and their type of fault.
+    /// Every validator that has an equivocation in `units` must have an entry here, but there can
+    /// be additional entries for other kinds of faults.
     faults: HashMap<ValidatorIndex, Fault<C>>,
     /// The full panorama, corresponding to the complete protocol state.
+    /// This points to the latest unit of every honest validator.
     panorama: Panorama<C>,
-    /// All currently endorsed votes, by hash.
-    endorsements: HashMap<C::Hash, Vec<Endorsement<C>>>,
-    /// Votes that don't yet have 2/3 of stake endorsing them.
-    incomplete_endorsements: HashMap<C::Hash, Vec<Endorsement<C>>>,
+    /// All currently endorsed units, by hash: units that have enough endorsements to be cited even
+    /// if they naively cite an equivocator.
+    endorsements: HashMap<C::Hash, ValidatorMap<Option<C::Signature>>>,
+    /// Units that don't yet have 1/2 of stake endorsing them.
+    /// Signatures are stored in a map so that a single validator sending lots of signatures for
+    /// different units doesn't cause us to allocate a lot of memory.
+    incomplete_endorsements: HashMap<C::Hash, BTreeMap<ValidatorIndex, C::Signature>>,
+    /// Clock to measure time spent in fork choice computation.
+    clock: Clock,
 }
 
 impl<C: Context> State<C> {
@@ -162,12 +192,13 @@ impl<C: Context> State<C> {
             params,
             weights,
             cumulative_w,
-            votes: HashMap::new(),
+            units: HashMap::new(),
             blocks: HashMap::new(),
             faults,
             panorama,
             endorsements: HashMap::new(),
             incomplete_endorsements: HashMap::new(),
+            clock: Clock::new(),
         }
     }
 
@@ -203,7 +234,7 @@ impl<C: Context> State<C> {
 
     /// Returns the total weight of all known-faulty validators.
     pub(crate) fn faulty_weight(&self) -> Weight {
-        self.faulty_weight_in(&self.panorama)
+        self.faulty_weight_in(self.panorama())
     }
 
     /// Returns the sum of all validators' voting weights.
@@ -216,46 +247,53 @@ impl<C: Context> State<C> {
     }
 
     /// Returns evidence against validator nr. `idx`, if present.
-    pub(crate) fn opt_evidence(&self, idx: ValidatorIndex) -> Option<&Evidence<C>> {
-        self.opt_fault(idx).and_then(Fault::evidence)
+    pub(crate) fn maybe_evidence(&self, idx: ValidatorIndex) -> Option<&Evidence<C>> {
+        self.maybe_fault(idx).and_then(Fault::evidence)
     }
 
-    /// Returns endorsements for `vote`, if any.
-    pub(crate) fn opt_endorsements(&self, vote: &C::Hash) -> Option<Vec<Endorsement<C>>> {
-        self.endorsements.get(vote).cloned()
+    /// Returns endorsements for `unit`, if any.
+    pub(crate) fn maybe_endorsements(&self, unit: &C::Hash) -> Option<Vec<SignedEndorsement<C>>> {
+        self.endorsements.get(unit).map(|signatures| {
+            signatures
+                .iter_some()
+                .map(|(vidx, sig)| SignedEndorsement::new(Endorsement::new(*unit, vidx), *sig))
+                .collect()
+        })
     }
 
     /// Returns whether evidence against validator nr. `idx` is known.
     pub(crate) fn has_evidence(&self, idx: ValidatorIndex) -> bool {
-        self.opt_evidence(idx).is_some()
+        self.maybe_evidence(idx).is_some()
     }
 
-    /// Returns whether we have all endorsements for `vote`.
-    pub(crate) fn has_all_endorsements<'a, I: IntoIterator<Item = &'a ValidatorIndex>>(
+    /// Returns whether we have all endorsements for `unit`.
+    pub(crate) fn has_all_endorsements<I: IntoIterator<Item = ValidatorIndex>>(
         &self,
-        vote: &C::Hash,
+        unit: &C::Hash,
         v_ids: I,
     ) -> bool {
-        self.incomplete_endorsements
-            .get(vote)
-            .map(|v| {
-                v_ids
-                    .into_iter()
-                    .all(|v_id| v.get(v_id.0 as usize).is_some())
-            })
-            .unwrap_or(false)
+        if self.endorsements.contains_key(unit) {
+            true // We have enough endorsements for this unit.
+        } else if let Some(sigs) = self.incomplete_endorsements.get(unit) {
+            v_ids.into_iter().all(|v_id| sigs.contains_key(&v_id))
+        } else {
+            v_ids.into_iter().next().is_none()
+        }
     }
 
-    /// Returns whether we have seen enough endorsements for the vote.
-    /// Vote is endorsed when it, or its descendant, has more than ≥ ⅔ of votes (by weight).
+    /// Returns whether we have seen enough endorsements for the unit.
+    /// Unit is endorsed when it has endorsements from more than 50% of the validators (by weight).
     pub(crate) fn is_endorsed(&self, hash: &C::Hash) -> bool {
         self.endorsements.contains_key(hash)
-        // TODO: check if any descendant (from the same creator) of `hash` is endorsed.
     }
 
-    /// Returns hash of vote that needs to be endorsed.
-    pub(crate) fn needs_endorsements(&self, _vote: &SignedWireVote<C>) -> Option<C::Hash> {
-        None
+    /// Returns hash of unit that needs to be endorsed.
+    pub(crate) fn needs_endorsements(&self, unit: &SignedWireUnit<C>) -> Option<C::Hash> {
+        unit.wire_unit
+            .endorsed
+            .iter()
+            .find(|hash| !self.endorsements.contains_key(&hash))
+            .cloned()
     }
 
     /// Marks the given validator as faulty, unless it is already banned or we have direct evidence.
@@ -265,7 +303,7 @@ impl<C: Context> State<C> {
     }
 
     /// Returns the fault type of validator nr. `idx`, if it is known to be faulty.
-    pub(crate) fn opt_fault(&self, idx: ValidatorIndex) -> Option<&Fault<C>> {
+    pub(crate) fn maybe_fault(&self, idx: ValidatorIndex) -> Option<&Fault<C>> {
         self.faults.get(&idx)
     }
 
@@ -275,33 +313,38 @@ impl<C: Context> State<C> {
     }
 
     /// Returns an iterator over all faulty validators.
-    pub(crate) fn faulty_validators<'a>(&'a self) -> impl Iterator<Item = ValidatorIndex> + 'a {
+    pub(crate) fn faulty_validators(&self) -> impl Iterator<Item = ValidatorIndex> + '_ {
         self.faults.keys().cloned()
     }
 
-    /// Returns the vote with the given hash, if present.
-    pub(crate) fn opt_vote(&self, hash: &C::Hash) -> Option<&Vote<C>> {
-        self.votes.get(hash)
+    /// Returns an iterator over latest unit hashes from honest validators.
+    pub(crate) fn iter_correct_hashes(&self) -> impl Iterator<Item = &C::Hash> {
+        self.panorama.iter_correct_hashes()
     }
 
-    /// Returns whether the vote with the given hash is known.
-    pub(crate) fn has_vote(&self, hash: &C::Hash) -> bool {
-        self.votes.contains_key(hash)
+    /// Returns the unit with the given hash, if present.
+    pub(crate) fn maybe_unit(&self, hash: &C::Hash) -> Option<&Unit<C>> {
+        self.units.get(hash)
     }
 
-    /// Returns the vote with the given hash. Panics if not found.
-    pub(crate) fn vote(&self, hash: &C::Hash) -> &Vote<C> {
-        self.opt_vote(hash).expect("vote hash must exist")
+    /// Returns whether the unit with the given hash is known.
+    pub(crate) fn has_unit(&self, hash: &C::Hash) -> bool {
+        self.units.contains_key(hash)
     }
 
-    /// Returns the block contained in the vote with the given hash, if present.
-    pub(crate) fn opt_block(&self, hash: &C::Hash) -> Option<&Block<C>> {
+    /// Returns the unit with the given hash. Panics if not found.
+    pub(crate) fn unit(&self, hash: &C::Hash) -> &Unit<C> {
+        self.maybe_unit(hash).expect("unit hash must exist")
+    }
+
+    /// Returns the block contained in the unit with the given hash, if present.
+    pub(crate) fn maybe_block(&self, hash: &C::Hash) -> Option<&Block<C>> {
         self.blocks.get(hash)
     }
 
-    /// Returns the block contained in the vote with the given hash. Panics if not found.
+    /// Returns the block contained in the unit with the given hash. Panics if not found.
     pub(crate) fn block(&self, hash: &C::Hash) -> &Block<C> {
-        self.opt_block(hash).expect("block hash must exist")
+        self.maybe_block(hash).expect("block hash must exist")
     }
 
     /// Returns the complete protocol state's latest panorama.
@@ -321,108 +364,233 @@ impl<C: Context> State<C> {
         self.cumulative_w.binary_search(&r).unwrap_or_else(identity)
     }
 
-    /// Adds the vote to the protocol state.
+    /// Adds the unit to the protocol state.
     ///
-    /// The vote must be valid, and its dependencies satisfied.
-    pub(crate) fn add_valid_vote(&mut self, swvote: SignedWireVote<C>) {
-        let wvote = &swvote.wire_vote;
-        self.update_panorama(&swvote);
-        let hash = wvote.hash();
-        let fork_choice = self.fork_choice(&wvote.panorama).cloned();
-        let (vote, opt_value) = Vote::new(swvote, fork_choice.as_ref(), self);
-        if let Some(value) = opt_value {
+    /// The unit must be valid (see `validate_unit`), and its dependencies satisfied.
+    pub(crate) fn add_valid_unit(&mut self, swunit: SignedWireUnit<C>) {
+        let wunit = &swunit.wire_unit;
+        let hash = wunit.hash();
+        if self.has_unit(&hash) {
+            warn!(%hash, "called add_valid_unit twice");
+            return;
+        }
+        let instance_id = wunit.instance_id;
+        let fork_choice = self.fork_choice(&wunit.panorama).cloned();
+        let (unit, maybe_value) = Unit::new(swunit, fork_choice.as_ref(), self);
+        if let Some(value) = maybe_value {
             let block = Block::new(fork_choice, value, self);
             self.blocks.insert(hash, block);
         }
-        self.votes.insert(hash, vote);
+        self.units.insert(hash, unit);
+
+        // Update the panorama.
+        let unit = self.unit(&hash);
+        let creator = unit.creator;
+        let new_obs = match (self.panorama.get(creator), unit.panorama.get(creator)) {
+            (Observation::Faulty, _) => Observation::Faulty,
+            (obs0, obs1) if obs0 == obs1 => Observation::Correct(hash),
+            (Observation::None, _) => panic!("missing creator's previous unit"),
+            (Observation::Correct(hash0), _) => {
+                // We have all dependencies of unit, but it does not cite hash0 as its predecessor,
+                // which is our latest known unit by the creator. It must therefore cite an older
+                // unit and so its sequence number must be at most the same as hash0. Hence it is
+                // an equivocation, and to prove that, we only need to provide the other unit with
+                // the same sequence number.
+                let prev0 = self.find_in_swimlane(hash0, unit.seq_number).unwrap();
+                let wunit0 = self.wire_unit(prev0, instance_id).unwrap();
+                let wunit1 = self.wire_unit(&hash, instance_id).unwrap();
+                self.add_evidence(Evidence::Equivocation(wunit0, wunit1));
+                Observation::Faulty
+            }
+        };
+        self.panorama[creator] = new_obs;
     }
 
     /// Adds direct evidence proving a validator to be faulty, unless that validators is already
-    /// banned or we already have other direct evidence.
-    pub(crate) fn add_evidence(&mut self, evidence: Evidence<C>) {
+    /// banned or we already have other direct evidence. This must only be called with valid
+    /// evidence (see `Evidence::validate`). Returns `false` if the evidence was not added because
+    /// the perpetrator is banned or we already have evidence against them.
+    pub(crate) fn add_evidence(&mut self, evidence: Evidence<C>) -> bool {
         let idx = evidence.perpetrator();
         match self.faults.get(&idx) {
-            Some(&Fault::Banned) | Some(&Fault::Direct(_)) => return,
+            Some(&Fault::Banned) | Some(&Fault::Direct(_)) => return false,
             None | Some(&Fault::Indirect) => (),
         }
         // TODO: Should use Display, not Debug!
-        info!(?evidence, "marking validator #{} as faulty", idx.0);
+        trace!(?evidence, "marking validator #{} as faulty", idx.0);
         self.faults.insert(idx, Fault::Direct(evidence));
         self.panorama[idx] = Observation::Faulty;
+        true
     }
 
-    /// Add set of endorsements to the state.
-    /// If, after adding, we have collected enough endorsements to consider vote _endorsed_,
+    /// Adds a set of endorsements to the state.
+    /// If, after adding, we have collected enough endorsements to consider unit _endorsed_,
     /// it will be *upgraded* to fully endorsed.
+    ///
+    /// Endorsements must be validated before calling this: The endorsers must exist, the
+    /// signatures must be valid and the endorsed unit must be present in `self.units`.
     pub(crate) fn add_endorsements(&mut self, endorsements: Endorsements<C>) {
-        let vote = *endorsements.vote();
-        let validator_count = self.validator_count();
-        info!("Received endorsements of {:?}", vote);
-        {
-            let entry = self
-                .incomplete_endorsements
-                .entry(vote)
-                .or_insert_with(|| Vec::with_capacity(validator_count));
-            for (vid, signature) in endorsements.endorsers {
-                // Add endorsements from validators we haven't seen endorsement yet.
-                if !entry.iter().any(|e| e.validator_idx() == vid) {
-                    let endorsement = Endorsement::new(vote, vid, signature);
-                    entry.push(endorsement)
-                }
-            }
+        let uhash = *endorsements.unit();
+        if self.endorsements.contains_key(&uhash) {
+            return; // We already have a sufficient number of endorsements.
         }
-        // Stake required to consider vote to be endorsed.
-        let threshold = self.total_weight() / 3 * 2;
-        let endorsed: Weight = self
-            .incomplete_endorsements
-            .get(&vote)
-            .unwrap()
-            .iter()
-            .map(|e| {
-                let v_id = e.validator_idx();
-                self.weight(v_id)
-            })
+        info!("Received endorsements of {:?}", uhash);
+        self.incomplete_endorsements
+            .entry(uhash)
+            .or_default()
+            .extend(endorsements.endorsers);
+        let endorsed: Weight = self.incomplete_endorsements[&uhash]
+            .keys()
+            .map(|vidx| self.weight(*vidx))
             .sum();
-        if endorsed >= threshold {
-            info!(%vote, "Vote endorsed by at least 2/3 of validators.");
-            let fully_endorsed = self.incomplete_endorsements.remove(&vote).unwrap();
-            self.endorsements.insert(vote, fully_endorsed);
+        // Stake required to consider unit to be endorsed.
+        let threshold = self.total_weight() / 2;
+        if endorsed > threshold {
+            info!(%uhash, "Unit endorsed by at least 1/2 of validators.");
+            let mut fully_endorsed = self.incomplete_endorsements.remove(&uhash).unwrap();
+            let endorsed_map = self
+                .weights()
+                .keys()
+                .map(|vidx| fully_endorsed.remove(&vidx))
+                .collect();
+            self.endorsements.insert(uhash, endorsed_map);
         }
     }
 
-    pub(crate) fn wire_vote(
+    /// Returns whether this state already includes an endorsement of `uhash` by `vidx`.
+    pub(crate) fn has_endorsement(&self, uhash: &C::Hash, vidx: ValidatorIndex) -> bool {
+        self.endorsements
+            .get(uhash)
+            .map(|vmap| vmap[vidx].is_some())
+            .unwrap_or(false)
+            || self
+                .incomplete_endorsements
+                .get(uhash)
+                .map(|ends| ends.contains_key(&vidx))
+                .unwrap_or(false)
+    }
+
+    /// Creates new `Evidence` if the new endorsements contain any that conflict with existing
+    /// ones.
+    ///
+    /// Endorsements must be validated before calling this: The endorsers must exist, the
+    /// signatures must be valid and the endorsed unit must be present in `self.units`.
+    pub(crate) fn find_conflicting_endorsements(
+        &self,
+        endorsements: &Endorsements<C>,
+        instance_id: &C::InstanceId,
+    ) -> Vec<Evidence<C>> {
+        let uhash = endorsements.unit();
+        let unit = self.unit(&uhash);
+        if !self.has_evidence(unit.creator) {
+            return vec![]; // There are no equivocations, so endorsements cannot conflict.
+        }
+
+        // We are only interested in endorsements that we didn't know before and whose validators
+        // we don't already have evidence against.
+        let is_new_endorsement = |&&(vidx, _): &&(ValidatorIndex, _)| {
+            if self.has_evidence(vidx) {
+                false
+            } else if let Some(known_endorsements) = self.endorsements.get(&uhash) {
+                known_endorsements[vidx].is_none()
+            } else if let Some(known_endorsements) = self.incomplete_endorsements.get(&uhash) {
+                !known_endorsements.contains_key(&vidx)
+            } else {
+                true
+            }
+        };
+        let new_endorsements = endorsements.endorsers.iter().filter(is_new_endorsement);
+
+        // For each new endorser, find a pair of conflicting endorsements, if it exists.
+        // Order the data so that the first unit has a lower or equal sequence number.
+        let conflicting_endorsements = new_endorsements.filter_map(|&(vidx, ref sig)| {
+            // Iterate over all existing endorsements by vidx.
+            let known_endorsements = self.endorsements.iter();
+            let known_incomplete_endorsements = self.incomplete_endorsements.iter();
+            let known_vidx_endorsements = known_endorsements
+                .filter_map(|(uhash2, sigs2)| sigs2[vidx].as_ref().map(|sig2| (uhash2, sig2)));
+            let known_vidx_incomplete_endorsements = known_incomplete_endorsements
+                .filter_map(|(uhash2, sigs2)| sigs2.get(&vidx).map(|sig2| (uhash2, sig2)));
+            // Find a conflicting one, i.e. one that endorses a unit with the same creator as uhash
+            // but incompatible with uhash. Put the data into a tuple, with the earlier unit first.
+            known_vidx_endorsements
+                .chain(known_vidx_incomplete_endorsements)
+                .find(|(uhash2, _)| {
+                    // TODO: Limit the difference of sequence numbers?
+                    self.unit(uhash2).creator == unit.creator && !self.is_compatible(&uhash, uhash2)
+                })
+                .map(|(uhash2, sig2)| {
+                    if unit.seq_number <= self.unit(uhash2).seq_number {
+                        (vidx, uhash, sig, uhash2, sig2)
+                    } else {
+                        (vidx, uhash2, sig2, uhash, sig)
+                    }
+                })
+        });
+
+        // Create an Evidence instance for each conflict we found.
+        conflicting_endorsements
+            .filter_map(|(vidx, uhash1, sig1, uhash2, sig2)| {
+                let unit1 = self.unit(uhash1);
+                let unit2 = self.unit(uhash2);
+                let ee_limit = self.params().endorsement_evidence_limit();
+                if unit1.seq_number.saturating_add(ee_limit) < unit2.seq_number {
+                    return None;
+                }
+                let swimlane2 = self
+                    .swimlane(uhash2)
+                    .skip(1)
+                    .take_while(|(_, pred2)| pred2.seq_number >= unit1.seq_number)
+                    .map(|(pred2_hash, _)| self.wire_unit(pred2_hash, *instance_id).unwrap())
+                    .collect();
+                Some(Evidence::Endorsements {
+                    endorsement1: SignedEndorsement::new(Endorsement::new(*uhash1, vidx), *sig1),
+                    unit1: self.wire_unit(uhash1, *instance_id).unwrap(),
+                    endorsement2: SignedEndorsement::new(Endorsement::new(*uhash2, vidx), *sig2),
+                    unit2: self.wire_unit(uhash2, *instance_id).unwrap(),
+                    swimlane2,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the `SignedWireUnit` with the given hash, if it is present in the state.
+    pub(crate) fn wire_unit(
         &self,
         hash: &C::Hash,
         instance_id: C::InstanceId,
-    ) -> Option<SignedWireVote<C>> {
-        let vote = self.opt_vote(hash)?.clone();
-        let opt_block = self.opt_block(hash);
-        let value = opt_block.map(|block| block.value.clone());
-        let wvote = WireVote {
-            panorama: vote.panorama.clone(),
-            creator: vote.creator,
+    ) -> Option<SignedWireUnit<C>> {
+        let unit = self.maybe_unit(hash)?.clone();
+        let maybe_block = self.maybe_block(hash);
+        let value = maybe_block.map(|block| block.value.clone());
+        let endorsed = unit.claims_endorsed().cloned().collect();
+        let wunit = WireUnit {
+            panorama: unit.panorama.clone(),
+            creator: unit.creator,
             instance_id,
             value,
-            seq_number: vote.seq_number,
-            timestamp: vote.timestamp,
-            round_exp: vote.round_exp,
+            seq_number: unit.seq_number,
+            timestamp: unit.timestamp,
+            round_exp: unit.round_exp,
+            endorsed,
         };
-        Some(SignedWireVote {
-            wire_vote: wvote,
-            signature: vote.signature,
+        Some(SignedWireUnit {
+            wire_unit: wunit,
+            signature: unit.signature,
         })
     }
 
     /// Returns the fork choice from `pan`'s view, or `None` if there are no blocks yet.
     ///
-    /// The correct validators' latest votes count as votes for the block they point to, as well as
+    /// The correct validators' latest units count as votes for the block they point to, as well as
     /// all of its ancestors. At each level the block with the highest score is selected from the
     /// children of the previously selected block (or from all blocks at height 0), until a block
     /// is reached that has no children with any votes.
     pub(crate) fn fork_choice<'a>(&'a self, pan: &Panorama<C>) -> Option<&'a C::Hash> {
+        let start = self.clock.start();
         // Collect all correct votes in a `Tallies` map, sorted by height.
         let to_entry = |(obs, w): (&Observation<C>, &Weight)| {
-            let bhash = &self.vote(obs.correct()?).block;
+            let bhash = &self.unit(obs.correct()?).block;
             Some((self.block(bhash).height, bhash, *w))
         };
         let mut tallies: Tallies<C> = pan.iter().zip(&self.weights).filter_map(to_entry).collect();
@@ -433,6 +601,9 @@ impl<C: Context> State<C> {
             tallies = tallies.filter_descendants(height, bhash, self);
             // If there are no blocks left, `bhash` itself is the fork choice. Otherwise repeat.
             if tallies.is_empty() {
+                let end = self.clock.end();
+                let delta = self.clock.delta(start, end).as_nanos();
+                trace!(%delta,"Time taken for fork-choice to run");
                 return Some(bhash);
             }
         }
@@ -459,155 +630,154 @@ impl<C: Context> State<C> {
         self.find_ancestor(&block.skip_idx[i], height)
     }
 
-    /// Returns an error if `swvote` is invalid. This can be called even if the dependencies are
+    /// Returns an error if `swunit` is invalid. This can be called even if the dependencies are
     /// not present yet.
-    pub(crate) fn pre_validate_vote(&self, swvote: &SignedWireVote<C>) -> Result<(), VoteError> {
-        let wvote = &swvote.wire_vote;
-        let creator = wvote.creator;
+    pub(crate) fn pre_validate_unit(&self, swunit: &SignedWireUnit<C>) -> Result<(), UnitError> {
+        let wunit = &swunit.wire_unit;
+        let creator = wunit.creator;
         if creator.0 as usize >= self.validator_count() {
-            error!("Nonexistent validator should be rejected in Highway::pre_validate_vote.");
-            return Err(VoteError::Creator); // Should be unreachable.
+            error!("Nonexistent validator should be rejected in Highway::pre_validate_unit.");
+            return Err(UnitError::Creator); // Should be unreachable.
         }
         if Some(&Fault::Banned) == self.faults.get(&creator) {
-            return Err(VoteError::Banned);
+            return Err(UnitError::Banned);
         }
-        if wvote.round_exp < self.params.min_round_exp() {
-            return Err(VoteError::RoundLength);
+        if wunit.round_exp < self.params.min_round_exp() {
+            return Err(UnitError::RoundLengthExpLessThanMinimum);
         }
-        if wvote.value.is_none() && !wvote.panorama.has_correct() {
-            return Err(VoteError::MissingBlock);
+        if wunit.round_exp > self.params.max_round_exp() {
+            return Err(UnitError::RoundLengthExpGreaterThanMaximum);
         }
-        if wvote.panorama.len() != self.validator_count() {
-            return Err(VoteError::PanoramaLength(wvote.panorama.len()));
+        if wunit.value.is_none() && !wunit.panorama.has_correct() {
+            return Err(UnitError::MissingBlock);
         }
-        if wvote.panorama.get(creator).is_faulty() {
-            return Err(VoteError::FaultyCreator);
+        if wunit.panorama.len() != self.validator_count() {
+            return Err(UnitError::PanoramaLength(wunit.panorama.len()));
+        }
+        if wunit.panorama.get(creator).is_faulty() {
+            return Err(UnitError::FaultyCreator);
         }
         Ok(())
     }
 
-    /// Returns an error if `swvote` is invalid. Must only be called once all dependencies have
-    /// been added to the state.
-    pub(crate) fn validate_vote(&self, swvote: &SignedWireVote<C>) -> Result<(), VoteError> {
-        let wvote = &swvote.wire_vote;
-        let creator = wvote.creator;
-        let panorama = &wvote.panorama;
-        let timestamp = wvote.timestamp;
+    /// Returns an error if `swunit` is invalid. Must only be called once `pre_validate_unit`
+    /// returned `Ok` and all dependencies have been added to the state.
+    pub(crate) fn validate_unit(&self, swunit: &SignedWireUnit<C>) -> Result<(), UnitError> {
+        let wunit = &swunit.wire_unit;
+        let creator = wunit.creator;
+        let panorama = &wunit.panorama;
+        let timestamp = wunit.timestamp;
         panorama.validate(self)?;
-        if panorama.iter_correct(self).any(|v| v.timestamp > timestamp) {
-            return Err(VoteError::Timestamps);
+        if panorama.iter_correct(self).any(|v| v.timestamp > timestamp)
+            || wunit.timestamp < self.params.start_timestamp()
+        {
+            return Err(UnitError::Timestamps);
         }
-        if wvote.seq_number != panorama.next_seq_num(self, creator) {
-            return Err(VoteError::SequenceNumber);
+        if wunit.seq_number != panorama.next_seq_num(self, creator) {
+            return Err(UnitError::SequenceNumber);
         }
-        let r_id = round_id(timestamp, wvote.round_exp);
-        let opt_prev_vote = panorama[creator].correct().map(|vh| self.vote(vh));
-        if let Some(prev_vote) = opt_prev_vote {
-            if prev_vote.round_exp != wvote.round_exp {
+        let r_id = round_id(timestamp, wunit.round_exp);
+        let maybe_prev_unit = wunit.previous().map(|vh| self.unit(vh));
+        if let Some(prev_unit) = maybe_prev_unit {
+            if prev_unit.round_exp != wunit.round_exp {
                 // The round exponent must not change within a round: Even with respect to the
-                // greater of the two exponents, a round boundary must be between the votes.
-                let max_re = prev_vote.round_exp.max(wvote.round_exp);
-                if prev_vote.timestamp >> max_re == timestamp >> max_re {
-                    return Err(VoteError::RoundLength);
+                // greater of the two exponents, a round boundary must be between the units.
+                let max_re = prev_unit.round_exp.max(wunit.round_exp);
+                if prev_unit.timestamp >> max_re == timestamp >> max_re {
+                    return Err(UnitError::RoundLengthExpChangedWithinRound);
                 }
             }
-            // There can be at most two votes per round: proposal/confirmation and witness.
-            if let Some(prev2_vote) = prev_vote.previous().map(|h2| self.vote(h2)) {
-                if prev2_vote.round_id() == r_id {
-                    return Err(VoteError::ThreeVotesInRound);
+            // There can be at most two units per round: proposal/confirmation and witness.
+            if let Some(prev2_unit) = prev_unit.previous().map(|h2| self.unit(h2)) {
+                if prev2_unit.round_id() == r_id {
+                    return Err(UnitError::ThreeUnitsInRound);
                 }
             }
         }
-        if wvote.value.is_some() {
-            // If this vote is a block, it must be the first vote in this round, its timestamp must
+        // All endorsed units from the panorama of this wunit.
+        let endorsements_in_panorama = panorama
+            .iter_correct_hashes()
+            .flat_map(|hash| self.unit(hash).claims_endorsed())
+            .collect::<HashSet<_>>();
+        if endorsements_in_panorama
+            .iter()
+            .any(|&e| !wunit.endorsed.iter().any(|h| h == e))
+        {
+            return Err(UnitError::EndorsementsNotMonotonic);
+        }
+        if wunit.value.is_some() {
+            // If this unit is a block, it must be the first unit in this round, its timestamp must
             // match the round ID, and the creator must be the round leader.
-            if opt_prev_vote.map_or(false, |pv| pv.round_id() == r_id)
+            if maybe_prev_unit.map_or(false, |pv| pv.round_id() == r_id)
                 || timestamp != r_id
                 || self.leader(r_id) != creator
             {
-                return Err(VoteError::NonLeaderBlock(self.leader(r_id)));
+                return Err(UnitError::NonLeaderBlock(self.leader(r_id)));
             }
             // It's not allowed to create a child block of a terminal block.
             let is_terminal = |hash: &C::Hash| self.is_terminal_block(hash);
             if self.fork_choice(panorama).map_or(false, is_terminal) {
-                return Err(VoteError::ValueAfterTerminalBlock);
+                return Err(UnitError::ValueAfterTerminalBlock);
             }
         }
-        // TODO: Validate against LNC.
-        Ok(())
+        for hash in &wunit.endorsed {
+            if !wunit.panorama.sees(self, hash) {
+                return Err(UnitError::EndorsedButUnseen {
+                    hash: format!("{:?}", hash),
+                    wire_unit: format!("{:?}", wunit),
+                });
+            }
+        }
+        match self.validate_lnc(creator, panorama, &wunit.endorsed) {
+            None => Ok(()),
+            Some(vidx) => Err(UnitError::LncNaiveCitation(vidx)),
+        }
     }
 
     /// Returns `true` if the `bhash` is a block that can have no children.
     pub(crate) fn is_terminal_block(&self, bhash: &C::Hash) -> bool {
         self.blocks.get(bhash).map_or(false, |block| {
-            block.height >= self.params.end_height()
-                && self.vote(bhash).timestamp >= self.params.end_timestamp()
+            block.height + 1 >= self.params.end_height()
+                && self.unit(bhash).timestamp >= self.params.end_timestamp()
         })
     }
 
-    /// Updates `self.panorama` with an incoming vote. Panics if dependencies are missing.
-    ///
-    /// If the new vote is valid, it will just add `Observation::Correct(wvote.hash())` to the
-    /// panorama. If it represents an equivocation, it adds `Observation::Faulty` and updates
-    /// `self.faults`.
-    ///
-    /// Panics unless all dependencies of `wvote` have already been added to `self`.
-    fn update_panorama(&mut self, swvote: &SignedWireVote<C>) {
-        let wvote = &swvote.wire_vote;
-        let creator = wvote.creator;
-        let new_obs = match (self.panorama.get(creator), wvote.panorama.get(creator)) {
-            (Observation::Faulty, _) => Observation::Faulty,
-            (obs0, obs1) if obs0 == obs1 => Observation::Correct(wvote.hash()),
-            (Observation::None, _) => panic!("missing creator's previous vote"),
-            (Observation::Correct(hash0), _) => {
-                // If we have all dependencies of wvote and still see the sender as correct, the
-                // predecessor of wvote must be a predecessor of hash0. So we already have a
-                // conflicting vote with the same sequence number:
-                let prev0 = self.find_in_swimlane(hash0, wvote.seq_number).unwrap();
-                let wvote0 = self.wire_vote(prev0, wvote.instance_id).unwrap();
-                self.add_evidence(Evidence::Equivocation(wvote0, swvote.clone()));
-                Observation::Faulty
-            }
-        };
-        self.panorama[wvote.creator] = new_obs;
-    }
-
     /// Returns `true` if this is a proposal and the creator is not faulty.
-    pub(super) fn is_correct_proposal(&self, vote: &Vote<C>) -> bool {
-        !self.is_faulty(vote.creator)
-            && self.leader(vote.timestamp) == vote.creator
-            && vote.timestamp == round_id(vote.timestamp, vote.round_exp)
+    pub(super) fn is_correct_proposal(&self, unit: &Unit<C>) -> bool {
+        !self.is_faulty(unit.creator)
+            && self.leader(unit.timestamp) == unit.creator
+            && unit.timestamp == round_id(unit.timestamp, unit.round_exp)
     }
 
     /// Returns the hash of the message with the given sequence number from the creator of `hash`,
-    /// or `None` if the sequence number is higher than that of the vote with `hash`.
+    /// or `None` if the sequence number is higher than that of the unit with `hash`.
     fn find_in_swimlane<'a>(&'a self, hash: &'a C::Hash, seq_number: u64) -> Option<&'a C::Hash> {
-        let vote = self.vote(hash);
-        match vote.seq_number.cmp(&seq_number) {
+        let unit = self.unit(hash);
+        match unit.seq_number.cmp(&seq_number) {
             Ordering::Equal => Some(hash),
             Ordering::Less => None,
             Ordering::Greater => {
-                let diff = vote.seq_number - seq_number;
+                let diff = unit.seq_number - seq_number;
                 // We want to make the greatest step 2^i such that 2^i <= diff.
                 let max_i = log2(diff) as usize;
-                let i = max_i.min(vote.skip_idx.len() - 1);
-                self.find_in_swimlane(&vote.skip_idx[i], seq_number)
+                let i = max_i.min(unit.skip_idx.len() - 1);
+                self.find_in_swimlane(&unit.skip_idx[i], seq_number)
             }
         }
     }
 
-    /// Returns an iterator over votes (with hashes) by the same creator, in reverse chronological
-    /// order, starting with the specified vote.
+    /// Returns an iterator over units (with hashes) by the same creator, in reverse chronological
+    /// order, starting with the specified unit. Panics if no unit with `uhash` exists.
     pub(crate) fn swimlane<'a>(
         &'a self,
-        vhash: &'a C::Hash,
-    ) -> impl Iterator<Item = (&'a C::Hash, &'a Vote<C>)> {
-        let mut next = Some(vhash);
+        uhash: &'a C::Hash,
+    ) -> impl Iterator<Item = (&'a C::Hash, &'a Unit<C>)> {
+        let mut next = Some(uhash);
         iter::from_fn(move || {
             let current = next?;
-            let vote = self.vote(current);
-            next = vote.previous();
-            Some((current, vote))
+            let unit = self.unit(current);
+            next = unit.previous();
+            Some((current, unit))
         })
     }
 
@@ -632,8 +802,234 @@ impl<C: Context> State<C> {
         weighted_median(
             self.panorama
                 .iter_correct(self)
-                .map(|vote| (vote.round_exp, self.weight(vote.creator))),
+                .map(|unit| (unit.round_exp, self.weight(unit.creator))),
         )
+    }
+
+    /// Returns `true` if the state contains no units.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Returns the set of units (by hash) that are endorsed and seen from the panorama.
+    pub(crate) fn seen_endorsed(&self, pan: &Panorama<C>) -> BTreeSet<C::Hash> {
+        // First we collect all units that were already seen as endorsed by earlier units.
+        let mut result: BTreeSet<C::Hash> = pan
+            .iter_correct_hashes()
+            .flat_map(|hash| self.unit(hash).endorsed.iter().cloned())
+            .collect();
+        // Now add all remaining endorsed units. Since the pan.sees check is expensive, do it only
+        // for the ones that are actually new.
+        for hash in self.endorsements.keys() {
+            if !result.contains(hash) && pan.sees(self, hash) {
+                result.insert(*hash);
+            }
+        }
+        result
+    }
+
+    /// Validates whether a unit with the given panorama and `endorsed` set satsifies the
+    /// Limited Naïveté Criterion (LNC).
+    /// Returns index of the first equivocator that was cited naively in violation of the LNC, or
+    /// `None` if the LNC is satisfied.
+    fn validate_lnc(
+        &self,
+        creator: ValidatorIndex,
+        panorama: &Panorama<C>,
+        endorsed: &BTreeSet<C::Hash>,
+    ) -> Option<ValidatorIndex> {
+        let violates_lnc =
+            |eq_idx: &ValidatorIndex| !self.satisfies_lnc_for(creator, panorama, endorsed, *eq_idx);
+        panorama.iter_faulty().find(violates_lnc)
+    }
+
+    /// Returns `true` if there is at most one fork by the validator `eq_idx` that is cited naively
+    /// by a unit with the given panorama and `endorsed` set, or earlier units by the same creator.
+    fn satisfies_lnc_for(
+        &self,
+        creator: ValidatorIndex,
+        panorama: &Panorama<C>,
+        endorsed: &BTreeSet<C::Hash>,
+        eq_idx: ValidatorIndex,
+    ) -> bool {
+        // Find all forks by eq_idx that are cited naively by the panorama itself.
+        // * If it's more than one, return false: the LNC is violated.
+        // * If it's none, return true: If the LNC were violated, it would be because of two naive
+        //   citations by creator's earlier units. So the latest of those earlier units would
+        //   already be violating the LNC itself, and thus would not have been added to the state.
+        // * Otherwise store the unique naively cited fork in naive_fork.
+        let mut maybe_naive_fork = None;
+        {
+            // Returns true if any endorsed unit cites the given unit.
+            let seen_by_endorsed = |hash| endorsed.iter().any(|e_hash| self.sees(e_hash, hash));
+
+            // Iterate over all units cited by the panorama.
+            let mut to_visit: Vec<_> = panorama.iter_correct_hashes().collect();
+            // This set is a filter so that units don't get added to to_visit twice.
+            let mut added_to_to_visit: HashSet<_> = to_visit.iter().cloned().collect();
+            while let Some(hash) = to_visit.pop() {
+                if seen_by_endorsed(hash) {
+                    continue; // This unit and everything below is not cited naively.
+                }
+                let unit = self.unit(hash);
+                match &unit.panorama[eq_idx] {
+                    Observation::Correct(eq_hash) => {
+                        // The unit (and everything it cites) can only see a single fork.
+                        // No need to traverse further downward.
+                        if !seen_by_endorsed(eq_hash) {
+                            // The fork is cited naively!
+                            match maybe_naive_fork {
+                                // It's the first naively cited fork we found.
+                                None => maybe_naive_fork = Some(eq_hash),
+                                Some(other_hash) => {
+                                    // If eq_hash is later than other_hash, it is the tip of the
+                                    // same fork. If it is earlier, then other_hash is the tip.
+                                    if self.sees_correct(eq_hash, other_hash) {
+                                        maybe_naive_fork = Some(eq_hash);
+                                    } else if !self.sees_correct(other_hash, eq_hash) {
+                                        return false; // We found two incompatible forks!
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // No forks are cited by this unit. No need to traverse further.
+                    Observation::None => (),
+                    // The unit still sees the equivocator as faulty: We need to traverse further
+                    // down the graph to find all cited forks.
+                    Observation::Faulty => to_visit.extend(
+                        unit.panorama
+                            .iter_correct_hashes()
+                            .filter(|hash| added_to_to_visit.insert(hash)),
+                    ),
+                }
+            }
+        }
+        let naive_fork = match maybe_naive_fork {
+            None => return true, // No forks are cited naively.
+            Some(naive_fork) => naive_fork,
+        };
+
+        // Iterate over all earlier units by creator, and find all forks by eq_idx they
+        // naively cite. If any of those forks are incompatible with naive_fork, the LNC is
+        // violated.
+        let mut maybe_pred_hash = panorama[creator].correct();
+        while let Some(pred_hash) = maybe_pred_hash {
+            let pred_unit = self.unit(pred_hash);
+            // Returns true if any endorsed (according to pred_unit) unit cites the given unit.
+            let seen_by_endorsed = |hash| {
+                pred_unit
+                    .endorsed
+                    .iter()
+                    .any(|e_hash| self.sees(e_hash, hash))
+            };
+            // Iterate over all units seen by pred_unit.
+            let mut to_visit = vec![pred_hash];
+            // This set is a filter so that units don't get added to to_visit twice.
+            let mut added_to_to_visit: HashSet<_> = to_visit.iter().cloned().collect();
+            while let Some(hash) = to_visit.pop() {
+                if seen_by_endorsed(hash) {
+                    continue; // This unit and everything below is not cited naively.
+                }
+                let unit = self.unit(hash);
+                match &unit.panorama[eq_idx] {
+                    Observation::Correct(eq_hash) => {
+                        if !seen_by_endorsed(eq_hash) && !self.is_compatible(eq_hash, &naive_fork) {
+                            return false;
+                        }
+                    }
+                    // No forks are cited by this unit. No need to traverse further.
+                    Observation::None => (),
+                    // The unit still sees the equivocator as faulty: We need to traverse further
+                    // down the graph to find all cited forks.
+                    Observation::Faulty => to_visit.extend(
+                        unit.panorama
+                            .iter_correct_hashes()
+                            .filter(|hash| added_to_to_visit.insert(hash)),
+                    ),
+                }
+            }
+            if !pred_unit.panorama[eq_idx].is_faulty() {
+                // This unit and everything below sees only a single fork of the equivocator. If we
+                // haven't found conflicting naively cited forks yet, there are none.
+                return true;
+            }
+            maybe_pred_hash = pred_unit.previous();
+        }
+        true // No earlier messages, so no conflicting naively cited forks.
+    }
+
+    /// Returns whether the unit with `hash0` sees the one with `hash1` (i.e. `hash0 ≥ hash1`),
+    /// and sees `hash1`'s creator as correct.
+    pub(crate) fn sees_correct(&self, hash0: &C::Hash, hash1: &C::Hash) -> bool {
+        hash0 == hash1 || self.unit(hash0).panorama.sees_correct(self, hash1)
+    }
+
+    /// Returns whether the unit with `hash0` sees the one with `hash1` (i.e. `hash0 ≥ hash1`).
+    pub(crate) fn sees(&self, hash0: &C::Hash, hash1: &C::Hash) -> bool {
+        hash0 == hash1 || self.unit(hash0).panorama.sees(self, hash1)
+    }
+
+    // Returns whether the units with `hash0` and `hash1` see each other or are equal.
+    fn is_compatible(&self, hash0: &C::Hash, hash1: &C::Hash) -> bool {
+        hash0 == hash1
+            || self.unit(hash0).panorama.sees(self, hash1)
+            || self.unit(hash1).panorama.sees(self, hash0)
+    }
+
+    /// Returns the panorama of the confirmation for the leader unit `uhash`.
+    pub(crate) fn confirmation_panorama(
+        &self,
+        creator: ValidatorIndex,
+        uhash: &C::Hash,
+    ) -> Panorama<C> {
+        self.valid_panorama(creator, self.inclusive_panorama(uhash))
+    }
+
+    /// Creates a panorama that is valid for use in `creator`'s next unit, and as close as possible
+    /// to the given one. It is only modified if necessary for validity:
+    /// * Cite `creator`'s previous unit, i.e. don't equivocate.
+    /// * Satisfy the LNC, i.e. don't add new naively cited forks.
+    pub(crate) fn valid_panorama(
+        &self,
+        creator: ValidatorIndex,
+        mut pan: Panorama<C>,
+    ) -> Panorama<C> {
+        // Make sure the panorama sees the creator's own previous unit.
+        let maybe_prev_uhash = self.panorama()[creator].correct();
+        if let Some(prev_uhash) = maybe_prev_uhash {
+            if pan[creator].correct() != Some(prev_uhash) {
+                pan = pan.merge(self, &self.inclusive_panorama(prev_uhash));
+            }
+        }
+        let endorsed = self.seen_endorsed(&pan);
+        if self.validate_lnc(creator, &pan, &endorsed).is_none() {
+            return pan;
+        }
+        // `pan` violates the LNC.
+        // Start from the creator's previous unit, mark all faulty
+        // validators as faulty, and add only endorsed units from correct validators.
+        pan = maybe_prev_uhash.map_or_else(
+            || Panorama::new(self.validator_count()),
+            |prev_uhash| self.inclusive_panorama(prev_uhash),
+        );
+        for faulty_v in self.faulty_validators() {
+            pan[faulty_v] = Observation::Faulty;
+        }
+        for endorsed_hash in &endorsed {
+            if !pan.sees_correct(self, endorsed_hash) {
+                pan = pan.merge(self, &self.inclusive_panorama(endorsed_hash));
+            }
+        }
+        pan
+    }
+
+    /// Returns panorama of a unit where latest entry of the creator is that unit's hash.
+    pub(crate) fn inclusive_panorama(&self, uhash: &C::Hash) -> Panorama<C> {
+        let unit = self.unit(&uhash);
+        let mut pan = unit.panorama.clone();
+        pan[unit.creator] = Observation::Correct(*uhash);
+        pan
     }
 }
 

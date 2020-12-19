@@ -1,10 +1,12 @@
-mod balance;
 mod block;
 mod command;
 mod common;
 mod deploy;
+mod docs;
 mod generate_completion;
 mod get_auction_info;
+mod get_balance;
+mod get_era_info_by_switch_block;
 mod get_state_hash;
 mod keygen;
 mod query_state;
@@ -13,7 +15,8 @@ use clap::{crate_description, crate_version, App};
 
 use casper_node::rpcs::{
     account::PutDeploy,
-    chain::{GetBlock, GetStateRootHash},
+    chain::{GetBlock, GetBlockTransfers, GetEraInfoBySwitchBlock, GetStateRootHash},
+    docs::ListRpcs,
     info::GetDeploy,
     state::{GetAuctionInfo, GetBalance, GetItem as QueryState},
 };
@@ -36,13 +39,16 @@ enum DisplayOrder {
     Transfer,
     GetDeploy,
     GetBlock,
+    GetBlockTransfers,
     ListDeploys,
-    GetBalance,
     GetStateRootHash,
     QueryState,
+    GetBalance,
+    GetEraInfo,
     GetAuctionInfo,
     Keygen,
     GenerateCompletion,
+    GetRpcs,
 }
 
 fn cli<'a, 'b>() -> App<'a, 'b> {
@@ -56,17 +62,24 @@ fn cli<'a, 'b>() -> App<'a, 'b> {
         .subcommand(Transfer::build(DisplayOrder::Transfer as usize))
         .subcommand(GetDeploy::build(DisplayOrder::GetDeploy as usize))
         .subcommand(GetBlock::build(DisplayOrder::GetBlock as usize))
+        .subcommand(GetBlockTransfers::build(
+            DisplayOrder::GetBlockTransfers as usize,
+        ))
         .subcommand(ListDeploys::build(DisplayOrder::ListDeploys as usize))
         .subcommand(GetBalance::build(DisplayOrder::GetBalance as usize))
         .subcommand(GetStateRootHash::build(
             DisplayOrder::GetStateRootHash as usize,
         ))
         .subcommand(QueryState::build(DisplayOrder::QueryState as usize))
+        .subcommand(GetEraInfoBySwitchBlock::build(
+            DisplayOrder::GetEraInfo as usize,
+        ))
         .subcommand(GetAuctionInfo::build(DisplayOrder::GetAuctionInfo as usize))
         .subcommand(Keygen::build(DisplayOrder::Keygen as usize))
         .subcommand(GenerateCompletion::build(
             DisplayOrder::GenerateCompletion as usize,
         ))
+        .subcommand(ListRpcs::build(DisplayOrder::GetRpcs as usize))
 }
 
 #[tokio::main]
@@ -80,13 +93,16 @@ async fn main() {
         (Transfer::NAME, Some(matches)) => Transfer::run(matches),
         (GetDeploy::NAME, Some(matches)) => GetDeploy::run(matches),
         (GetBlock::NAME, Some(matches)) => GetBlock::run(matches),
+        (GetBlockTransfers::NAME, Some(matches)) => GetBlockTransfers::run(matches),
         (ListDeploys::NAME, Some(matches)) => ListDeploys::run(matches),
         (GetBalance::NAME, Some(matches)) => GetBalance::run(matches),
         (GetStateRootHash::NAME, Some(matches)) => GetStateRootHash::run(matches),
         (QueryState::NAME, Some(matches)) => QueryState::run(matches),
+        (GetEraInfoBySwitchBlock::NAME, Some(matches)) => GetEraInfoBySwitchBlock::run(matches),
         (GetAuctionInfo::NAME, Some(matches)) => GetAuctionInfo::run(matches),
         (Keygen::NAME, Some(matches)) => Keygen::run(matches),
         (GenerateCompletion::NAME, Some(matches)) => GenerateCompletion::run(matches),
+        (ListRpcs::NAME, Some(matches)) => ListRpcs::run(matches),
         _ => {
             let _ = cli().print_long_help();
             println!();

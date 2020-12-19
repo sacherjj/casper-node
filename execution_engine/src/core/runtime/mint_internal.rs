@@ -21,10 +21,9 @@ where
     }
 
     fn put_key(&mut self, name: &str, key: Key) {
-        // TODO: update RuntimeProvider to better handle errors
-        self.context
-            .put_key(name.to_string(), key)
-            .expect("should put key")
+        // NOTE: This is just quick and dirty hack to trade panic into an unrelated runtime error
+        // (EE-1129)
+        let _res = self.context.put_key(name.to_string(), key);
     }
     fn get_key(&self, name: &str) -> Option<Key> {
         self.context.named_keys_get(name).cloned()
@@ -39,17 +38,20 @@ where
 {
     fn new_uref<T: CLTyped + ToBytes>(&mut self, init: T) -> URef {
         let cl_value: CLValue = CLValue::from_t(init).expect("should convert value");
-        self.context
-            .new_uref(StoredValue::CLValue(cl_value))
-            .expect("should create new uref")
+        // NOTE: This is just quick and dirty hack to trade panic into an unrelated runtime error
+        // (EE-1129)
+        match self.context.new_uref(StoredValue::CLValue(cl_value)) {
+            Ok(result) => result,
+            Err(_err) => URef::default(),
+        }
     }
 
     fn write_local<K: ToBytes, V: CLTyped + ToBytes>(&mut self, key: K, value: V) {
         let key_bytes = key.to_bytes().expect("should serialize");
         let cl_value = CLValue::from_t(value).expect("should convert");
-        self.context
-            .write_ls(&key_bytes, cl_value)
-            .expect("should write local state")
+        // NOTE: This is just quick and dirty hack to trade panic into an unrelated runtime error
+        // (EE-1129)
+        let _res = self.context.write_ls(&key_bytes, cl_value);
     }
 
     fn read_local<K: ToBytes, V: CLTyped + FromBytes>(
@@ -88,14 +90,14 @@ where
     fn write<T: CLTyped + ToBytes>(&mut self, uref: URef, value: T) -> Result<(), Error> {
         let cl_value = CLValue::from_t(value).expect("should convert");
         self.context
-            .write_gs(Key::URef(uref), StoredValue::CLValue(cl_value))
+            .metered_write_gs(Key::URef(uref), StoredValue::CLValue(cl_value))
             .map_err(|_| Error::Storage)
     }
 
     fn add<T: CLTyped + ToBytes>(&mut self, uref: URef, value: T) -> Result<(), Error> {
         let cl_value = CLValue::from_t(value).expect("should convert");
         self.context
-            .add_gs(Key::URef(uref), StoredValue::CLValue(cl_value))
+            .metered_add_gs(uref, cl_value)
             .map_err(|_| Error::Storage)
     }
 }
@@ -105,8 +107,15 @@ where
     R: StateReader<Key, StoredValue>,
     R::Error: Into<execution::Error>,
 {
-    fn record_transfer(&mut self, source: URef, target: URef, amount: U512) -> Result<(), Error> {
-        let result = Runtime::record_transfer(self, source, target, amount);
+    fn record_transfer(
+        &mut self,
+        maybe_to: Option<AccountHash>,
+        source: URef,
+        target: URef,
+        amount: U512,
+        id: Option<u64>,
+    ) -> Result<(), Error> {
+        let result = Runtime::record_transfer(self, maybe_to, source, target, amount, id);
         result.map_err(|_| Error::RecordTransferFailure)
     }
 }

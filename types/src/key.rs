@@ -1,4 +1,8 @@
-use alloc::{format, string::String, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::{
     array::TryFromSliceError,
     convert::TryFrom,
@@ -6,12 +10,14 @@ use core::{
 };
 
 use hex_fmt::HexFmt;
+use serde::{de::Error as SerdeError, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     account::{self, AccountHash, TryFromSliceForAccountHashError},
-    bytesrepr::{self, Error, FromBytes, ToBytes},
+    auction::EraId,
+    bytesrepr::{self, Error, FromBytes, ToBytes, U64_SERIALIZED_LENGTH},
     uref::{self, URef, UREF_SERIALIZED_LENGTH},
-    DeployHash, DEPLOY_HASH_LENGTH,
+    DeployHash, TransferAddr, DEPLOY_HASH_LENGTH, TRANSFER_ADDR_LENGTH,
 };
 
 const ACCOUNT_ID: u8 = 0;
@@ -19,17 +25,18 @@ const HASH_ID: u8 = 1;
 const UREF_ID: u8 = 2;
 const TRANSFER_ID: u8 = 3;
 const DEPLOY_INFO_ID: u8 = 4;
+const ERA_INFO_ID: u8 = 5;
 
 const HASH_PREFIX: &str = "hash-";
-const TRANSFER_PREFIX: &str = "transfer-";
 const DEPLOY_INFO_PREFIX: &str = "deploy-";
+const ERA_INFO_PREFIX: &str = "era-";
 
 /// The number of bytes in a Blake2b hash
 pub const BLAKE2B_DIGEST_LENGTH: usize = 32;
 /// The number of bytes in a [`Key::Hash`].
 pub const KEY_HASH_LENGTH: usize = 32;
 /// The number of bytes in a [`Key::Transfer`].
-pub const KEY_TRANSFER_LENGTH: usize = 32;
+pub const KEY_TRANSFER_LENGTH: usize = TRANSFER_ADDR_LENGTH;
 /// The number of bytes in a [`Key::DeployInfo`].
 pub const KEY_DEPLOY_INFO_LENGTH: usize = DEPLOY_HASH_LENGTH;
 
@@ -39,6 +46,7 @@ const KEY_HASH_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_HASH_LE
 const KEY_UREF_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + UREF_SERIALIZED_LENGTH;
 const KEY_TRANSFER_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_TRANSFER_LENGTH;
 const KEY_DEPLOY_INFO_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_DEPLOY_INFO_LENGTH;
+const KEY_ERA_INFO_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + U64_SERIALIZED_LENGTH;
 
 /// An alias for [`Key`]s hash variant.
 pub type HashAddr = [u8; KEY_HASH_LENGTH];
@@ -55,8 +63,6 @@ pub type ContractHash = HashAddr;
 pub type ContractWasmHash = HashAddr;
 /// An alias for [`Key`]s hash variant.
 pub type ContractPackageHash = HashAddr;
-/// An alias for [`Key`]s transfer variant.
-pub type TransferAddr = HashAddr;
 
 /// The type under which data (e.g. [`CLValue`](crate::CLValue)s, smart contracts, user accounts)
 /// are indexed on the network.
@@ -74,6 +80,8 @@ pub enum Key {
     Transfer(TransferAddr),
     /// A `Key` under which we store a deploy info.
     DeployInfo(DeployHash),
+    /// A `Key` under which we store an era info.
+    EraInfo(EraId),
 }
 
 #[derive(Debug)]
@@ -116,6 +124,21 @@ impl From<uref::FromStrError> for FromStrError {
     }
 }
 
+impl Display for FromStrError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            FromStrError::InvalidPrefix => write!(f, "invalid prefix"),
+            FromStrError::Hex(error) => write!(f, "decode from hex: {}", error),
+            FromStrError::Account(error) => write!(f, "account from string error: {:?}", error),
+            FromStrError::Hash(error) => write!(f, "hash from string error: {}", error),
+            FromStrError::AccountHash(error) => {
+                write!(f, "account hash from string error: {:?}", error)
+            }
+            FromStrError::URef(error) => write!(f, "uref from string error: {:?}", error),
+        }
+    }
+}
+
 impl Key {
     // This method is not intended to be used by third party crates.
     #[doc(hidden)]
@@ -126,6 +149,7 @@ impl Key {
             Key::URef(_) => String::from("Key::URef"),
             Key::Transfer(_) => String::from("Key::Transfer"),
             Key::DeployInfo(_) => String::from("Key::DeployInfo"),
+            Key::EraInfo(_) => String::from("Key::EraInfo"),
         }
     }
 
@@ -150,14 +174,21 @@ impl Key {
             Key::Account(account_hash) => account_hash.to_formatted_string(),
             Key::Hash(addr) => format!("{}{}", HASH_PREFIX, base16::encode_lower(addr)),
             Key::URef(uref) => uref.to_formatted_string(),
-            Key::Transfer(addr) => format!("{}{}", TRANSFER_PREFIX, base16::encode_lower(addr)),
+            Key::Transfer(transfer_addr) => transfer_addr.to_formatted_string(),
             Key::DeployInfo(addr) => {
-                format!("{}{}", DEPLOY_INFO_PREFIX, base16::encode_lower(addr))
+                format!(
+                    "{}{}",
+                    DEPLOY_INFO_PREFIX,
+                    base16::encode_lower(addr.as_bytes())
+                )
+            }
+            Key::EraInfo(era_id) => {
+                format!("{}{}", ERA_INFO_PREFIX, era_id.to_string())
             }
         }
     }
 
-    /// Parses a string formatted as per `Self::as_string()` into a `Key`.
+    /// Parses a string formatted as per `Self::to_formatted_string()` into a `Key`.
     pub fn from_formatted_str(input: &str) -> Result<Key, FromStrError> {
         if let Ok(account_hash) = AccountHash::from_formatted_str(input) {
             Ok(Key::Account(account_hash))
@@ -166,13 +197,11 @@ impl Key {
                 base16::decode(hex)?.as_ref(),
             )?))
         } else if let Some(hex) = input.strip_prefix(DEPLOY_INFO_PREFIX) {
-            Ok(Key::DeployInfo(DeployHash::try_from(
-                base16::decode(hex)?.as_ref(),
-            )?))
-        } else if let Some(hex) = input.strip_prefix(TRANSFER_PREFIX) {
-            Ok(Key::Transfer(TransferAddr::try_from(
-                base16::decode(hex)?.as_ref(),
-            )?))
+            Ok(Key::DeployInfo(DeployHash::new(
+                <[u8; DEPLOY_HASH_LENGTH]>::try_from(base16::decode(hex)?.as_ref())?,
+            )))
+        } else if let Ok(transfer_addr) = TransferAddr::from_formatted_str(input) {
+            Ok(Key::Transfer(transfer_addr))
         } else {
             Ok(Key::URef(URef::from_formatted_str(input)?))
         }
@@ -213,14 +242,24 @@ impl Key {
         }
     }
 
+    // TODO: remove this nightmare
     /// Creates the seed of a local key for a context with the given base key.
     pub fn into_seed(self) -> [u8; BLAKE2B_DIGEST_LENGTH] {
         match self {
             Key::Account(account_hash) => account_hash.value(),
             Key::Hash(bytes) => bytes,
             Key::URef(uref) => uref.addr(),
-            Key::Transfer(addr) => addr,
-            Key::DeployInfo(addr) => addr,
+            Key::Transfer(transfer_addr) => transfer_addr.value(),
+            Key::DeployInfo(addr) => addr.value(),
+            Key::EraInfo(era_id) => {
+                // stop-gap measure until this method is removed
+                let mut ret = [0u8; BLAKE2B_DIGEST_LENGTH];
+                let era_id_bytes = era_id.to_le_bytes();
+                let era_id_bytes_len = era_id_bytes.len();
+                assert!(era_id_bytes_len < BLAKE2B_DIGEST_LENGTH);
+                ret[..era_id_bytes_len].clone_from_slice(&era_id_bytes);
+                ret
+            }
         }
     }
 
@@ -238,8 +277,9 @@ impl Display for Key {
             Key::Account(account_hash) => write!(f, "Key::Account({})", account_hash),
             Key::Hash(addr) => write!(f, "Key::Hash({})", HexFmt(addr)),
             Key::URef(uref) => write!(f, "Key::{}", uref), /* Display impl for URef will append */
-            Key::Transfer(addr) => write!(f, "Key::Transfer({})", HexFmt(addr)),
-            Key::DeployInfo(addr) => write!(f, "Key::DeployInfo({})", HexFmt(addr)),
+            Key::Transfer(transfer_addr) => write!(f, "Key::Transfer({})", transfer_addr),
+            Key::DeployInfo(addr) => write!(f, "Key::DeployInfo({})", HexFmt(addr.as_bytes())),
+            Key::EraInfo(era_id) => write!(f, "Key::EraInfo({})", era_id),
         }
     }
 }
@@ -259,6 +299,12 @@ impl From<URef> for Key {
 impl From<AccountHash> for Key {
     fn from(account_hash: AccountHash) -> Key {
         Key::Account(account_hash)
+    }
+}
+
+impl From<TransferAddr> for Key {
+    fn from(transfer_addr: TransferAddr) -> Key {
+        Key::Transfer(transfer_addr)
     }
 }
 
@@ -286,6 +332,10 @@ impl ToBytes for Key {
                 result.push(DEPLOY_INFO_ID);
                 result.append(&mut addr.to_bytes()?);
             }
+            Key::EraInfo(era_id) => {
+                result.push(ERA_INFO_ID);
+                result.append(&mut era_id.to_bytes()?);
+            }
         }
         Ok(result)
     }
@@ -299,6 +349,7 @@ impl ToBytes for Key {
             Key::URef(_) => KEY_UREF_SERIALIZED_LENGTH,
             Key::Transfer(_) => KEY_TRANSFER_SERIALIZED_LENGTH,
             Key::DeployInfo(_) => KEY_DEPLOY_INFO_SERIALIZED_LENGTH,
+            Key::EraInfo(_) => KEY_ERA_INFO_SERIALIZED_LENGTH,
         }
     }
 }
@@ -312,7 +363,7 @@ impl FromBytes for Key {
                 Ok((Key::Account(account_hash), rem))
             }
             HASH_ID => {
-                let (hash, rem) = <[u8; KEY_HASH_LENGTH]>::from_bytes(remainder)?;
+                let (hash, rem) = FromBytes::from_bytes(remainder)?;
                 Ok((Key::Hash(hash), rem))
             }
             UREF_ID => {
@@ -324,10 +375,127 @@ impl FromBytes for Key {
                 Ok((Key::Transfer(transfer_addr), rem))
             }
             DEPLOY_INFO_ID => {
-                let (deploy_hash, rem) = DeployHash::from_bytes(remainder)?;
+                let (deploy_hash, rem) = FromBytes::from_bytes(remainder)?;
                 Ok((Key::DeployInfo(deploy_hash), rem))
             }
+            ERA_INFO_ID => {
+                let (era_id, rem) = FromBytes::from_bytes(remainder)?;
+                Ok((Key::EraInfo(era_id), rem))
+            }
             _ => Err(Error::Formatting),
+        }
+    }
+}
+
+mod serde_helpers {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) enum HumanReadable {
+        Account(String),
+        Hash(String),
+        URef(String),
+        Transfer(String),
+        DeployInfo(String),
+        EraInfo(String),
+    }
+
+    impl From<&Key> for HumanReadable {
+        fn from(key: &Key) -> Self {
+            let formatted_string = key.to_formatted_string();
+            match key {
+                Key::Account(_) => HumanReadable::Account(formatted_string),
+                Key::Hash(_) => HumanReadable::Hash(formatted_string),
+                Key::URef(_) => HumanReadable::URef(formatted_string),
+                Key::Transfer(_) => HumanReadable::Transfer(formatted_string),
+                Key::DeployInfo(_) => HumanReadable::DeployInfo(formatted_string),
+                Key::EraInfo(_) => HumanReadable::EraInfo(formatted_string),
+            }
+        }
+    }
+
+    impl TryFrom<HumanReadable> for Key {
+        type Error = FromStrError;
+
+        fn try_from(helper: HumanReadable) -> Result<Self, Self::Error> {
+            match helper {
+                HumanReadable::Account(formatted_string)
+                | HumanReadable::Hash(formatted_string)
+                | HumanReadable::URef(formatted_string)
+                | HumanReadable::Transfer(formatted_string)
+                | HumanReadable::DeployInfo(formatted_string)
+                | HumanReadable::EraInfo(formatted_string) => {
+                    Key::from_formatted_str(&formatted_string)
+                }
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    pub(super) enum BinarySerHelper<'a> {
+        Account(&'a AccountHash),
+        Hash(&'a HashAddr),
+        URef(&'a URef),
+        Transfer(&'a TransferAddr),
+        DeployInfo(&'a DeployHash),
+        EraInfo(&'a u64),
+    }
+
+    impl<'a> From<&'a Key> for BinarySerHelper<'a> {
+        fn from(key: &'a Key) -> Self {
+            match key {
+                Key::Account(account_hash) => BinarySerHelper::Account(account_hash),
+                Key::Hash(hash_addr) => BinarySerHelper::Hash(hash_addr),
+                Key::URef(uref) => BinarySerHelper::URef(uref),
+                Key::Transfer(transfer_addr) => BinarySerHelper::Transfer(transfer_addr),
+                Key::DeployInfo(deploy_hash) => BinarySerHelper::DeployInfo(deploy_hash),
+                Key::EraInfo(era_id) => BinarySerHelper::EraInfo(era_id),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) enum BinaryDeserHelper {
+        Account(AccountHash),
+        Hash(HashAddr),
+        URef(URef),
+        Transfer(TransferAddr),
+        DeployInfo(DeployHash),
+        EraInfo(EraId),
+    }
+
+    impl From<BinaryDeserHelper> for Key {
+        fn from(helper: BinaryDeserHelper) -> Self {
+            match helper {
+                BinaryDeserHelper::Account(account_hash) => Key::Account(account_hash),
+                BinaryDeserHelper::Hash(hash_addr) => Key::Hash(hash_addr),
+                BinaryDeserHelper::URef(uref) => Key::URef(uref),
+                BinaryDeserHelper::Transfer(transfer_addr) => Key::Transfer(transfer_addr),
+                BinaryDeserHelper::DeployInfo(deploy_hash) => Key::DeployInfo(deploy_hash),
+                BinaryDeserHelper::EraInfo(era_id) => Key::EraInfo(era_id),
+            }
+        }
+    }
+}
+
+impl Serialize for Key {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serde_helpers::HumanReadable::from(self).serialize(serializer)
+        } else {
+            serde_helpers::BinarySerHelper::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let human_readable = serde_helpers::HumanReadable::deserialize(deserializer)?;
+            Key::try_from(human_readable).map_err(SerdeError::custom)
+        } else {
+            let binary_helper = serde_helpers::BinaryDeserHelper::deserialize(deserializer)?;
+            Ok(Key::from(binary_helper))
         }
     }
 }
@@ -405,6 +573,16 @@ mod tests {
             format!("{}", hash_key),
             format!("Key::Hash({})", expected_hash)
         );
+        let transfer_key = Key::Transfer(TransferAddr::new(addr_array));
+        assert_eq!(
+            format!("{}", transfer_key),
+            format!("Key::Transfer({})", expected_hash)
+        );
+        let deploy_info_key = Key::DeployInfo(DeployHash::new(addr_array));
+        assert_eq!(
+            format!("{}", deploy_info_key),
+            format!("Key::DeployInfo({})", expected_hash)
+        );
     }
 
     #[test]
@@ -456,6 +634,12 @@ mod tests {
 
         let key_uref = Key::URef(URef::new([42; BLAKE2B_DIGEST_LENGTH], AccessRights::READ));
         assert!(key_uref.serialized_length() <= Key::max_serialized_length());
+
+        let key_transfer = Key::Transfer(TransferAddr::new([42; BLAKE2B_DIGEST_LENGTH]));
+        assert!(key_transfer.serialized_length() <= Key::max_serialized_length());
+
+        let key_deploy_info = Key::DeployInfo(DeployHash::new([42; BLAKE2B_DIGEST_LENGTH]));
+        assert!(key_deploy_info.serialized_length() <= Key::max_serialized_length());
     }
 
     fn round_trip(key: Key) {
@@ -466,12 +650,14 @@ mod tests {
 
     #[test]
     fn key_from_str() {
-        round_trip(Key::Account(AccountHash::new([0; BLAKE2B_DIGEST_LENGTH])));
+        round_trip(Key::Account(AccountHash::new([42; BLAKE2B_DIGEST_LENGTH])));
         round_trip(Key::Hash([42; KEY_HASH_LENGTH]));
         round_trip(Key::URef(URef::new(
             [255; BLAKE2B_DIGEST_LENGTH],
             AccessRights::READ,
         )));
+        round_trip(Key::Transfer(TransferAddr::new([42; KEY_HASH_LENGTH])));
+        round_trip(Key::DeployInfo(DeployHash::new([42; KEY_HASH_LENGTH])));
 
         let invalid_prefix = "a-0000000000000000000000000000000000000000000000000000000000000000";
         assert!(Key::from_formatted_str(invalid_prefix).is_err());
@@ -487,5 +673,41 @@ mod tests {
 
         let invalid_hex = "000000000000000000000000000000000000000000000000000000000000000g";
         assert!(Key::from_formatted_str(&format!("{}{}", HASH_PREFIX, invalid_hex)).is_err());
+    }
+
+    #[test]
+    fn key_to_json() {
+        let array = [42; BLAKE2B_DIGEST_LENGTH];
+        let hex_bytes = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a";
+
+        let key_account = Key::Account(AccountHash::new(array));
+        assert_eq!(
+            serde_json::to_string(&key_account).unwrap(),
+            format!(r#"{{"Account":"account-hash-{}"}}"#, hex_bytes)
+        );
+
+        let key_hash = Key::Hash(array);
+        assert_eq!(
+            serde_json::to_string(&key_hash).unwrap(),
+            format!(r#"{{"Hash":"hash-{}"}}"#, hex_bytes)
+        );
+
+        let key_uref = Key::URef(URef::new(array, AccessRights::READ));
+        assert_eq!(
+            serde_json::to_string(&key_uref).unwrap(),
+            format!(r#"{{"URef":"uref-{}-001"}}"#, hex_bytes)
+        );
+
+        let key_transfer = Key::Transfer(TransferAddr::new(array));
+        assert_eq!(
+            serde_json::to_string(&key_transfer).unwrap(),
+            format!(r#"{{"Transfer":"transfer-{}"}}"#, hex_bytes)
+        );
+
+        let key_deploy_info = Key::DeployInfo(DeployHash::new(array));
+        assert_eq!(
+            serde_json::to_string(&key_deploy_info).unwrap(),
+            format!(r#"{{"DeployInfo":"deploy-{}"}}"#, hex_bytes)
+        );
     }
 }

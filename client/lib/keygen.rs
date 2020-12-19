@@ -6,15 +6,15 @@ use casper_node::crypto::asymmetric_key::{PublicKey, SecretKey};
 
 use crate::error::{Error, Result};
 
-/// Default filename for the hex-encoded public key file.
-pub const PUBLIC_KEY_HEX: &str = "public_key_hex";
 /// Default filename for the PEM-encoded secret key file.
 pub const SECRET_KEY_PEM: &str = "secret_key.pem";
+/// Default filename for the hex-encoded public key file.
+pub const PUBLIC_KEY_HEX: &str = "public_key_hex";
 /// Default filename for the PEM-encoded public key file.
 pub const PUBLIC_KEY_PEM: &str = "public_key.pem";
 
-/// List of keygen related filenames.
-pub const FILES: [&str; 3] = [PUBLIC_KEY_HEX, SECRET_KEY_PEM, PUBLIC_KEY_PEM];
+/// List of keygen related filenames: "secret_key.pem", "public_key.pem" and "public_key_hex".
+pub const FILES: [&str; 3] = [SECRET_KEY_PEM, PUBLIC_KEY_PEM, PUBLIC_KEY_HEX];
 
 /// Name of Ed25519 algorithm.
 pub const ED25519: &str = "Ed25519";
@@ -25,13 +25,20 @@ pub const SECP256K1: &str = "secp256k1";
 /// the specified directory.
 ///
 /// The secret key is written to "secret_key.pem", and the public key is written to "public_key.pem"
-/// and also in hex format to "public_key_hex".  For the hex format, the algorithm's tag is
+/// and also in hex format to "public_key_hex". For the hex format, the algorithm's tag is
 /// prepended, e.g. `01` for Ed25519, `02` for secp256k1.
 ///
-/// If `force` is true, existing files will be overwritten.  If `force` is false and any of the
-/// files exist, `Error::FileAlreadyExists(path)` is returned and no files are written.
+/// If `force` is true, existing files will be overwritten. If `force` is false and any of the
+/// files exist, [`Error::FileAlreadyExists`](../enum.Error.html#variant.FileAlreadyExists) is
+/// returned and no files are written.
 pub fn generate_files(output_dir: &str, algorithm: &str, force: bool) -> Result<()> {
-    let _ = fs::create_dir_all(output_dir).map_err(|error| Error::IoError {
+    if output_dir.is_empty() {
+        return Err(Error::InvalidArgument(
+            "generate_files",
+            "empty output_dir provided, must be a valid path".to_string(),
+        ));
+    }
+    let _ = fs::create_dir_all(output_dir).map_err(move |error| Error::IoError {
         context: format!("unable to create directory at '{}'", output_dir),
         error,
     })?;
@@ -70,10 +77,20 @@ pub fn generate_files(output_dir: &str, algorithm: &str, force: bool) -> Result<
     })?;
 
     let secret_key_path = output_dir.join(SECRET_KEY_PEM);
-    secret_key.to_file(&secret_key_path)?;
+    secret_key
+        .to_file(&secret_key_path)
+        .map_err(|error| Error::CryptoError {
+            context: "secret_key",
+            error,
+        })?;
 
     let public_key_path = output_dir.join(PUBLIC_KEY_PEM);
-    public_key.to_file(&public_key_path)?;
+    public_key
+        .to_file(&public_key_path)
+        .map_err(|error| Error::CryptoError {
+            context: "public_key",
+            error,
+        })?;
 
     Ok(())
 }

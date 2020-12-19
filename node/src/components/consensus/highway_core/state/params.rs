@@ -7,10 +7,12 @@ pub(crate) struct Params {
     block_reward: u64,
     reduced_block_reward: u64,
     min_round_exp: u8,
+    max_round_exp: u8,
     init_round_exp: u8,
     end_height: u64,
     start_timestamp: Timestamp,
     end_timestamp: Timestamp,
+    endorsement_evidence_limit: u64,
 }
 
 impl Params {
@@ -27,6 +29,8 @@ impl Params {
     ///   summit does not exceed half the total weight.
     /// * `min_round_exp`: The minimum round exponent. `1 << min_round_exp` milliseconds is the
     ///   minimum round length.
+    /// * `max_round_exp`: The maximum round exponent. `1 << max_round_exp` milliseconds is the
+    ///   maximum round length.
     /// * `end_height`, `end_timestamp`: The last block will be the first one that has at least the
     ///   specified height _and_ is no earlier than the specified timestamp. No children of this
     ///   block can be proposed.
@@ -36,10 +40,12 @@ impl Params {
         block_reward: u64,
         reduced_block_reward: u64,
         min_round_exp: u8,
+        max_round_exp: u8,
         init_round_exp: u8,
         end_height: u64,
         start_timestamp: Timestamp,
         end_timestamp: Timestamp,
+        endorsement_evidence_limit: u64,
     ) -> Params {
         assert!(
             reduced_block_reward <= block_reward,
@@ -50,10 +56,12 @@ impl Params {
             block_reward,
             reduced_block_reward,
             min_round_exp,
+            max_round_exp,
             init_round_exp,
             end_height,
             start_timestamp,
             end_timestamp,
+            endorsement_evidence_limit,
         }
     }
 
@@ -79,6 +87,12 @@ impl Params {
         self.min_round_exp
     }
 
+    /// Returns the maximum round exponent. `1 << self.max_round_exp()` milliseconds is the maximum
+    /// round length.
+    pub(crate) fn max_round_exp(&self) -> u8 {
+        self.max_round_exp
+    }
+
     /// Returns the initial round exponent.
     pub(crate) fn init_round_exp(&self) -> u8 {
         self.init_round_exp
@@ -97,5 +111,19 @@ impl Params {
     /// Returns the minimum timestamp of the last block.
     pub(crate) fn end_timestamp(&self) -> Timestamp {
         self.end_timestamp
+    }
+
+    /// Returns the maximum number of additional units included in evidence for conflicting
+    /// endorsements. If you endorse two conflicting forks at sequence numbers that differ by more
+    /// than this, you get away with it and are not marked faulty.
+    pub(crate) fn endorsement_evidence_limit(&self) -> u64 {
+        self.endorsement_evidence_limit
+    }
+
+    /// Returns new `Params` with the update endorsement evidence limit.
+    #[cfg(test)]
+    pub(crate) fn with_endorsement_evidence_limit(mut self, new_limit: u64) -> Params {
+        self.endorsement_evidence_limit = new_limit;
+        self
     }
 }

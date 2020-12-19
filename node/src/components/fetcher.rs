@@ -9,15 +9,15 @@ use smallvec::smallvec;
 use tracing::{debug, error};
 
 use crate::{
-    components::{fetcher::event::FetchResponder, storage::Storage, Component},
+    components::{fetcher::event::FetchResponder, Component},
     effect::{
         requests::{LinearChainRequest, NetworkRequest, StorageRequest},
         EffectBuilder, EffectExt, Effects,
     },
     protocol::Message,
-    small_network::NodeId,
-    types::{Block, BlockByHeight, BlockHash, CryptoRngCore, Deploy, DeployHash, Item},
+    types::{Block, BlockByHeight, BlockHash, Deploy, DeployHash, Item, NodeId},
     utils::Source,
+    NodeRng,
 };
 
 pub use config::Config;
@@ -27,7 +27,7 @@ pub use event::{Event, FetchResult};
 pub trait ReactorEventT<T>:
     From<Event<T>>
     + From<NetworkRequest<NodeId, Message>>
-    + From<StorageRequest<Storage>>
+    + From<StorageRequest>
     // Won't be needed when we implement "get block by height" feature in storage.
     + From<LinearChainRequest<NodeId>>
     + Send
@@ -44,7 +44,7 @@ where
     <T as Item>::Id: 'static,
     REv: From<Event<T>>
         + From<NetworkRequest<NodeId, Message>>
-        + From<StorageRequest<Storage>>
+        + From<StorageRequest>
         + From<LinearChainRequest<NodeId>>
         + Send
         + 'static,
@@ -71,7 +71,7 @@ pub trait ItemFetcher<T: Item + 'static> {
         responders
             .entry(id)
             .or_default()
-            .entry(peer)
+            .entry(peer.clone())
             .or_default()
             .push(responder);
 
@@ -107,7 +107,7 @@ pub trait ItemFetcher<T: Item + 'static> {
     ) -> Effects<Event<T>> {
         match Message::new_get_request::<T>(&id) {
             Ok(message) => {
-                let mut effects = effect_builder.send_message(peer, message).ignore();
+                let mut effects = effect_builder.send_message(peer.clone(), message).ignore();
 
                 effects.extend(
                     effect_builder
@@ -160,7 +160,7 @@ pub trait ItemFetcher<T: Item + 'static> {
 
 /// The component which fetches an item from local storage or asks a peer if it's not in storage.
 #[derive(DataSize, Debug)]
-pub(crate) struct Fetcher<T>
+pub struct Fetcher<T>
 where
     T: Item + 'static,
 {
@@ -271,7 +271,7 @@ where
     fn handle_event(
         &mut self,
         effect_builder: EffectBuilder<REv>,
-        _rng: &mut dyn CryptoRngCore,
+        _rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         debug!(?event, "handling event");
@@ -291,15 +291,19 @@ where
             },
             Event::GotRemotely { item, source } => {
                 match source {
-                    Source::Peer(peer) => {
-                        self.signal(item.id(), Some(FetchResult::FromPeer(item, peer)), peer)
-                    }
+                    Source::Peer(peer) => self.signal(
+                        item.id(),
+                        Some(FetchResult::FromPeer(item, peer.clone())),
+                        peer,
+                    ),
                     Source::Client => {
                         // TODO - we could possibly also handle this case
                         Effects::new()
                     }
                 }
             }
+            // We do nothing in the case of having an incoming deploy rejected.
+            Event::RejectedRemotely { .. } => Effects::new(),
             Event::AbsentRemotely { id, peer } => self.signal(id, None, peer),
             Event::TimeoutPeer { id, peer } => self.signal(id, None, peer),
         }

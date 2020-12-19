@@ -22,7 +22,7 @@ where
         target: AccountHash,
         amount: U512,
     ) -> Result<TransferredTo, ApiError> {
-        self.transfer_from_purse_to_account(source, target, amount)
+        self.transfer_from_purse_to_account(source, target, amount, None)
             .expect("should transfer from purse to account")
     }
 
@@ -31,15 +31,12 @@ where
         source: URef,
         target: URef,
         amount: U512,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ApiError> {
         let mint_contract_key = self.get_mint_contract();
-        if self
-            .mint_transfer(mint_contract_key, source, target, amount)
-            .is_ok()
-        {
-            Ok(())
-        } else {
-            Err(())
+        match self.mint_transfer(mint_contract_key, None, source, target, amount, None) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(api_error)) => Err(api_error),
+            Err(_) => Err(ApiError::Transfer),
         }
     }
 

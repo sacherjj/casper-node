@@ -1,6 +1,6 @@
 [package]
 name = "casper-node"
-version = "1.5.0" # when updating, also update 'html_root_url' in lib.rs
+version = "0.3.1" # when updating, also update 'html_root_url' in lib.rs
 authors = ["Marc Brinkmann <marc@casperlabs.io>", "Fraser Hutchison <fraser@casperlabs.io>"]
 edition = "2018"
 description = "The Casper blockchain node"
@@ -19,12 +19,12 @@ base16 = "0.2.1"
 base64 = "0.13.0"
 bincode = "1.3.1"
 blake2 = { version = "0.9.0", default-features = false }
-casper-execution-engine = { version = "0.7.0", path = "../execution_engine" }
-casper-node-macros = { version = "0.1.0", path = "../node_macros" }
-casper-types = { version = "0.6.0", path = "../types", features = ["std", "gens"] }
+casper-execution-engine = { version = "0.3.1", path = "../execution_engine" }
+casper-node-macros = { version = "0.3.1", path = "../node_macros" }
+casper-types = { version = "0.3.1", path = "../types", features = ["std", "gens"] }
 chrono = "0.4.10"
 csv = "1.1.3"
-datasize = { version = "0.2.0", features = ["fake_clock-types", "futures-types", "smallvec-types", "tokio-types"] }
+datasize = { version = "0.2.3", features = ["fake_clock-types", "futures-types", "smallvec-types", "tokio-types"] }
 derive_more = "0.99.7"
 derp = "0.0.14"
 directories = "3.0.1"
@@ -32,6 +32,7 @@ ed25519-dalek = { version = "1.0.0", default-features = false, features = ["rand
 either = "1.5.3"
 enum-iterator = "0.6.0"
 futures = "0.3.5"
+futures-io = "0.3.5"
 getrandom = "0.2.0"
 hex = "0.4.2"
 hex-buffer-serde = "0.2.1"
@@ -42,14 +43,16 @@ humantime = "2.0.1"
 hyper = "0.13.7"
 itertools = "0.9.0"
 k256 = { version = "0.4.2", features = ["ecdsa", "zeroize"] }
-lazy_static = "1.4.0"
 libc = "0.2.66"
+libp2p = { version = "0.29.1", default-features = false, features = ["deflate", "dns", "floodsub", "gossipsub", "identify", "kad", "mdns-tokio", "mplex", "noise", "ping", "request-response", "tcp-tokio", "uds", "yamux"] }
 linked-hash-map = "0.5.3"
 lmdb = "0.8.0"
 log = { version = "0.4.8", features = ["std", "serde", "kv_unstable"] }
 num = { version = "0.3.0", default-features = false }
 num-derive = "0.3.0"
+num-rational = { version = "0.3.0", features = ["serde"] }
 num-traits = "0.2.10"
+once_cell = "1.5.2"
 openssl = "0.10.29"
 parity-wasm = "0.42.1"
 parking_lot = "0.11.0"
@@ -61,6 +64,7 @@ quanta = "0.6.5"
 rand = "0.7.3"
 rand_chacha = "0.2.2"
 regex = "1.3.9"
+schemars = { version = "0.8.0", features = ["preserve_order"] }
 sd-notify = "0.1.1"
 semver = { version = "0.11.0", features = ["serde"] }
 serde = { version = "1.0.110", features = ["derive"] }
@@ -68,8 +72,9 @@ serde-big-array = "0.3.0"
 serde_bytes = "0.11.5"
 serde_json = "1.0.55"
 serde_repr = "0.1.6"
+signal-hook = "0.1.16"
 signature = "1.1.0"
-smallvec = "1.4.0"
+smallvec = { version = "1.4.0", features = ["serde"] }
 structopt = "0.3.14"
 tempfile = "3.1.0"
 thiserror = "1.0.18"
@@ -84,17 +89,16 @@ tracing-subscriber = { version = "0.2.10", features = ["fmt", "json"] }
 uint = "0.8.3"
 untrusted = "0.7.1"
 uuid = { version = "0.8.1", features = ["serde", "v4"] }
-wabt = "0.10.0"
 warp = "0.2.4"
-warp-json-rpc = "0.1.6"
+warp-json-rpc = "0.2.0"
 wasmi = "0.6.2"
 wheelbuf = "0.2.0"
 
 [dev-dependencies]
 assert_matches = "1.3.0"
 fake_instant = "0.4.0"
-lazy_static = "1"
-pnet = "0.26.0"
+multihash = "0.11.4"
+pnet = "0.27.2"
 rand_core = "0.5.1"
 rand_pcg = "0.2.1"
 reqwest = "0.10.8"
@@ -102,7 +106,6 @@ tokio = { version = "0.2.20", features = ["test-util"] }
 
 [features]
 vendored-openssl = ['openssl/vendored']
-no-unstable-features = ["casper-types/no-unstable-features"]
 
 [[bin]]
 name = "casper-node"
@@ -117,6 +120,7 @@ vergen = "3.1.0"
 [package.metadata.deb]
 features = ["vendored-openssl"]
 revision = "0"
+depends = "curl"
 assets = [
     ["../target/release/casper-node", "/usr/bin/casper-node", "755"],
     ["../resources/maintainer_scripts/logrotate.d/casper-node", "/etc/logrotate.d/casper-node", "644"],
@@ -145,5 +149,3 @@ For information on using package, see https://github.com/CasperLabs/casper-node
 unit-scripts = "../resources/maintainer_scripts/casper_node"
 restart-after-upgrade = false
 
-[package.metadata.docs.rs]
-features = ["no-unstable-features"]

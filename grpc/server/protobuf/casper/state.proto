@@ -98,8 +98,7 @@ message CLType {
         CLType inner = 1;
     }
 
-    message FixedList {
-        CLType inner = 1;
+    message ByteArray {
         uint32 len = 2;
     }
 
@@ -134,7 +133,7 @@ message CLType {
         Simple simple_type = 1;
         Option option_type = 2;
         List list_type = 3;
-        FixedList fixed_list_type = 4;
+        ByteArray byte_array_type = 4;
         Result result_type = 5;
         Map map_type = 6;
         Tuple1 tuple1_type = 7;
@@ -174,13 +173,13 @@ message CLValueInstance {
             Key.URef uref = 13;
             Option option_value = 14;
             List list_value = 15;
-            FixedList fixed_list_value = 16;
+            ByteArray byte_array_value = 16;
             Result result_value = 17;
             Map map_value = 18;
             Tuple1 tuple1_value = 19;
             Tuple2 tuple2_value = 20;
             Tuple3 tuple3_value = 21;
-            bytes bytes_value = 22; // convenience for representing List(U8) / FixedList(U8)
+            bytes bytes_value = 22; // convenience for representing List(U8) / ByteArray
         }
     }
 
@@ -204,10 +203,8 @@ message CLValueInstance {
     message List {
         repeated Value values = 1;
     }
-    message FixedList {
-        uint32 length = 1;
-        // length of this list must be equal to length above
-        repeated Value values = 2;
+    message ByteArray {
+        bytes value = 1;
     }
     message Result {
         oneof value {
@@ -242,13 +239,19 @@ message ContractWasm {
     bytes wasm = 1;
 }
 
+message TransferId {
+    uint64 value = 1;
+}
+
 message Transfer {
     DeployHash deploy = 1;
     AccountHash from = 2;
-    Key.URef source = 3;
-    Key.URef target = 4;
-    BigInt amount = 5;
-    BigInt gas = 6;
+    AccountHash to = 3;
+    Key.URef source = 4;
+    Key.URef target = 5;
+    BigInt amount = 6;
+    BigInt gas = 7;
+    TransferId id = 8;
 }
 
 message DeployInfo {
@@ -257,6 +260,28 @@ message DeployInfo {
     AccountHash from = 3;
     Key.URef source = 4;
     BigInt gas = 5;
+}
+
+message SeigniorageAllocation {
+    message Validator {
+        bytes validator_public_key = 1;
+        BigInt amount = 2;
+    }
+
+    message Delegator {
+        bytes delegator_public_key = 1;
+        bytes validator_public_key = 2;
+        BigInt amount = 3;
+    }
+
+    oneof variants {
+        Validator validator = 1;
+        Delegator delegator = 2;
+    }
+}
+
+message EraInfo {
+    repeated SeigniorageAllocation seigniorage_allocations = 1;
 }
 
 // Value stored under a key in global state.
@@ -269,6 +294,7 @@ message StoredValue {
         ContractWasm contract_wasm = 5;
         Transfer transfer = 6;
         DeployInfo deploy_info = 7;
+        EraInfo era_info = 8;
     }
 }
 
@@ -307,6 +333,7 @@ message Key {
 		URef uref = 3;
 		TransferAddr transfer = 4;
 		DeployHash deploy_info = 5;
+		uint64 era_info = 6;
 	}
 
 	message Address {

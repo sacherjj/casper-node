@@ -1,26 +1,43 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt::{self, Debug, Display, Formatter},
 };
 
+use casper_types::{
+    bytesrepr::{self, FromBytes, ToBytes},
+    U512,
+};
 use datasize::DataSize;
 use itertools::Itertools;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
     components::consensus::{
         candidate_block::CandidateBlock, cl_context::ClContext,
-        consensus_protocol::ConsensusProtocol, era_supervisor::BONDED_ERAS,
-        protocols::highway::HighwayProtocol, ConsensusMessage,
+        consensus_protocol::ConsensusProtocol, protocols::highway::HighwayProtocol,
+        ConsensusMessage,
     },
     crypto::asymmetric_key::PublicKey,
-    types::ProtoBlock,
+    types::{ProtoBlock, Timestamp},
 };
 
 #[derive(
-    DataSize, Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+    DataSize,
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct EraId(pub(crate) u64);
 
 impl EraId {
@@ -36,13 +53,13 @@ impl EraId {
     }
 
     /// Returns an iterator over all eras that are still bonded in this one, including this one.
-    pub(crate) fn iter_bonded(&self) -> impl Iterator<Item = EraId> {
-        (self.0.saturating_sub(BONDED_ERAS)..=self.0).map(EraId)
+    pub(crate) fn iter_bonded(&self, bonded_eras: u64) -> impl Iterator<Item = EraId> {
+        (self.0.saturating_sub(bonded_eras)..=self.0).map(EraId)
     }
 
     /// Returns an iterator over all eras that are still bonded in this one, excluding this one.
-    pub(crate) fn iter_other_bonded(&self) -> impl Iterator<Item = EraId> {
-        (self.0.saturating_sub(BONDED_ERAS)..self.0).map(EraId)
+    pub(crate) fn iter_other(&self, count: u64) -> impl Iterator<Item = EraId> {
+        (self.0.saturating_sub(count)..self.0).map(EraId)
     }
 
     /// Returns the current era minus `x`, or `None` if that would be less than `0`.
@@ -54,6 +71,30 @@ impl EraId {
 impl Display for EraId {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "era {}", self.0)
+    }
+}
+
+impl From<EraId> for u64 {
+    fn from(era_id: EraId) -> Self {
+        era_id.0
+    }
+}
+
+impl ToBytes for EraId {
+    fn to_bytes(&self) -> Result<Vec<u8>, bytesrepr::Error> {
+        self.0.to_bytes()
+    }
+
+    fn serialized_length(&self) -> usize {
+        self.0.serialized_length()
+    }
+}
+
+impl FromBytes for EraId {
+    fn from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), bytesrepr::Error> {
+        let (id_value, remainder) = u64::from_bytes(bytes)?;
+        let era_id = EraId(id_value);
+        Ok((era_id, remainder))
     }
 }
 
@@ -85,6 +126,8 @@ impl PendingCandidate {
 pub struct Era<I> {
     /// The consensus protocol instance.
     pub(crate) consensus: Box<dyn ConsensusProtocol<I, ClContext>>,
+    /// The scheduled starting time of this era.
+    pub(crate) start_time: Timestamp,
     /// The height of this era's first block.
     pub(crate) start_height: u64,
     /// Pending candidate blocks, waiting for validation. The boolean is `true` if the proto block
@@ -98,22 +141,28 @@ pub struct Era<I> {
     pub(crate) slashed: HashSet<PublicKey>,
     /// Accusations collected in this era so far.
     accusations: HashSet<PublicKey>,
+    /// The validator weights.
+    validators: BTreeMap<PublicKey, U512>,
 }
 
 impl<I> Era<I> {
-    pub(crate) fn new<C: 'static + ConsensusProtocol<I, ClContext>>(
-        consensus: C,
+    pub(crate) fn new(
+        consensus: Box<dyn ConsensusProtocol<I, ClContext>>,
+        start_time: Timestamp,
         start_height: u64,
         newly_slashed: Vec<PublicKey>,
         slashed: HashSet<PublicKey>,
+        validators: BTreeMap<PublicKey, U512>,
     ) -> Self {
         Era {
-            consensus: Box::new(consensus),
+            consensus,
+            start_time,
             start_height,
             candidates: Vec::new(),
             newly_slashed,
             slashed,
             accusations: HashSet::new(),
+            validators,
         }
     }
 
@@ -188,6 +237,11 @@ impl<I> Era<I> {
         self.accusations.iter().cloned().sorted().collect()
     }
 
+    /// Returns the map of validator weights.
+    pub(crate) fn validators(&self) -> &BTreeMap<PublicKey, U512> {
+        &self.validators
+    }
+
     /// Removes and returns all candidate blocks with no missing dependencies.
     fn remove_complete_candidates(&mut self) -> Vec<CandidateBlock> {
         let (complete, candidates): (Vec<_>, Vec<_>) = self
@@ -212,11 +266,13 @@ where
         // Destructure self, so we can't miss any fields.
         let Era {
             consensus,
+            start_time,
             start_height,
             candidates,
             newly_slashed,
             slashed,
             accusations,
+            validators,
         } = self;
 
         // `DataSize` cannot be made object safe due its use of associated constants. We implement
@@ -237,10 +293,27 @@ where
         };
 
         consensus_heap_size
+            + start_time.estimate_heap_size()
             + start_height.estimate_heap_size()
             + candidates.estimate_heap_size()
             + newly_slashed.estimate_heap_size()
             + slashed.estimate_heap_size()
             + accusations.estimate_heap_size()
+            + validators.estimate_heap_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::Rng;
+
+    use super::*;
+    use crate::testing::TestRng;
+
+    #[test]
+    fn bytesrepr_roundtrip() {
+        let mut rng = TestRng::new();
+        let era_id = EraId(rng.gen());
+        bytesrepr::test_serialization_roundtrip(&era_id);
     }
 }

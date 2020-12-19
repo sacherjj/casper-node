@@ -68,7 +68,8 @@ const AUCTION_ERROR_MAX: u32 = AUCTION_ERROR_OFFSET + u8::MAX as u32;
 /// Errors which can be encountered while running a smart contract.
 ///
 /// An `ApiError` can be converted to a `u32` in order to be passed via the execution engine's
-/// `ext_ffi::revert()` function.  This means the information each variant can convey is limited.
+/// `ext_ffi::casper_revert()` function.  This means the information each variant can convey is
+/// limited.
 ///
 /// The variants are split into numeric ranges as follows:
 ///
@@ -88,7 +89,7 @@ const AUCTION_ERROR_MAX: u32 = AUCTION_ERROR_OFFSET + u8::MAX as u32;
 /// # use casper_types::ApiError::{self, *};
 /// # macro_rules! show_and_check {
 /// #     ($lhs:literal => $rhs:expr) => {
-/// #         assert_eq!($lhs as u32, ApiError::from($rhs).into());
+/// #         assert_eq!($lhs as u32, u32::from(ApiError::from($rhs)));
 /// #     };
 /// # }
 /// // General system errors:
@@ -209,7 +210,7 @@ const AUCTION_ERROR_MAX: u32 = AUCTION_ERROR_OFFSET + u8::MAX as u32;
 /// 64_515 => AuctionError::Serialization
 /// # );
 /// # show_and_check!(
-/// 64_516 => AuctionError::Transfer
+/// 64_516 => AuctionError::TransferToBidPurse
 /// # );
 /// # show_and_check!(
 /// 64_517 => AuctionError::InvalidAmount
@@ -222,6 +223,78 @@ const AUCTION_ERROR_MAX: u32 = AUCTION_ERROR_OFFSET + u8::MAX as u32;
 /// # );
 /// # show_and_check!(
 /// 64_520 => AuctionError::DelegatorNotFound
+/// # );
+/// # show_and_check!(
+/// 64_521 => AuctionError::Storage
+/// # );
+/// # show_and_check!(
+/// 64_522 => AuctionError::Bonding
+/// # );
+/// # show_and_check!(
+/// 64_523 => AuctionError::Unbonding
+/// # );
+/// # show_and_check!(
+/// 64_524 => AuctionError::ReleaseFounderStake
+/// # );
+/// # show_and_check!(
+/// 64_525 => AuctionError::GetBalance
+/// # );
+/// # show_and_check!(
+/// 64_526 => AuctionError::InvalidContext
+/// # );
+/// # show_and_check!(
+/// 64_527 => AuctionError::ValidatorFundsLocked
+/// # );
+/// # show_and_check!(
+/// 64_528 => AuctionError::InvalidCaller
+/// # );
+/// # show_and_check!(
+/// 64_529 => AuctionError::InvalidPublicKey
+/// # );
+/// # show_and_check!(
+/// 64_530 => AuctionError::BondNotFound
+/// # );
+/// # show_and_check!(
+/// 64_531 => AuctionError::CreatePurseFailed
+/// # );
+/// # show_and_check!(
+/// 64_532 => AuctionError::UnbondTooLarge
+/// # );
+/// # show_and_check!(
+/// 64_533 => AuctionError::BondTooSmall
+/// # );
+/// # show_and_check!(
+/// 64_534 => AuctionError::MissingDelegations
+/// # );
+/// # show_and_check!(
+/// 64_535 => AuctionError::MismatchedEraValidators
+/// # );
+/// # show_and_check!(
+/// 64_536 => AuctionError::MintReward
+/// # );
+/// # show_and_check!(
+/// 64_537 => AuctionError::InvalidValidatorSlotsValue
+/// # );
+/// # show_and_check!(
+/// 64_538 => AuctionError::MintReduceTotalSupply
+/// # );
+/// # show_and_check!(
+/// 64_539 => AuctionError::TransferToDelegatorPurse
+/// # );
+/// # show_and_check!(
+/// 64_540 => AuctionError::ValidatorRewardTransfer
+/// # );
+/// # show_and_check!(
+/// 64_541 => AuctionError::DelegatorRewardTransfer
+/// # );
+/// # show_and_check!(
+/// 64_542 => AuctionError::WithdrawDelegatorReward
+/// # );
+/// # show_and_check!(
+/// 64_543 => AuctionError::WithdrawValidatorReward
+/// # );
+/// # show_and_check!(
+/// 64_544 => AuctionError::TransferToUnbondingPurse
 /// # );
 /// // Contract header errors:
 /// use casper_types::contracts::Error as ContractHeaderError;

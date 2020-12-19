@@ -117,9 +117,14 @@ build-contracts-as: \
 .PHONY: build-contracts
 build-contracts: build-contracts-rs build-contracts-as
 
+resources/local/chainspec.toml: generate-chainspec.sh resources/local/chainspec.toml.in
+	@./$<
+
 .PHONY: test-rs
-test-rs: build-system-contracts
+test-rs: build-system-contracts resources/local/chainspec.toml
 	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) --workspace
+	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) --features=std --manifest-path=types/Cargo.toml
+	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) --features=std --manifest-path=smart_contracts/contract/Cargo.toml
 
 .PHONY: test-as
 test-as: setup-as
@@ -133,13 +138,13 @@ test-contracts-rs: build-contracts-rs
 	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) -p casper-engine-tests -- --ignored
 	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) --manifest-path "grpc/tests/Cargo.toml" --features "use-system-contracts" -- --ignored
 
-.PHONY: test-contracts_as
-test-contracts_as: build-contracts-rs build-contracts-as
+.PHONY: test-contracts-as
+test-contracts-as: build-contracts-rs build-contracts-as
 	@# see https://github.com/rust-lang/cargo/issues/5015#issuecomment-515544290
 	$(DISABLE_LOGGING) $(CARGO) test $(CARGO_FLAGS) --manifest-path "grpc/tests/Cargo.toml" --features "use-as-wasm" -- --ignored
 
 .PHONY: test-contracts
-test-contracts: test-contracts-rs test-contracts_as
+test-contracts: test-contracts-rs test-contracts-as
 
 .PHONY: check-format
 check-format:
@@ -162,7 +167,7 @@ build-docs-stable-rs: $(CRATES_WITH_DOCS_RS_MANIFEST_TABLE)
 
 doc-stable/%: CARGO_TOOLCHAIN += +stable
 doc-stable/%:
-	$(CARGO) doc $(CARGO_FLAGS) --manifest-path "$*/Cargo.toml" --features "no-unstable-features" --no-deps
+	$(CARGO) doc $(CARGO_FLAGS) --manifest-path "$*/Cargo.toml" --no-deps
 
 .PHONY: check-rs
 check-rs: \
@@ -186,6 +191,7 @@ check: \
 
 .PHONY: clean
 clean:
+	rm -rf resources/local/chainspec.toml
 	rm -rf $(CONTRACT_TARGET_DIR_AS)
 	rm -rf $(TOOL_TARGET_DIR)
 	rm -rf $(TOOL_WASM_DIR)
@@ -196,7 +202,7 @@ build-for-packaging: build-system-contracts build-client-contracts
 	$(CARGO) build --release
 
 .PHONY: deb
-deb: build-for-packaging
+deb: setup build-for-packaging
 	cd grpc/server && $(CARGO) deb -p casper-engine-grpc-server --no-build
 	cd node && $(CARGO) deb -p casper-node --no-build
 	cd client && $(CARGO) deb -p casper-client --no-build

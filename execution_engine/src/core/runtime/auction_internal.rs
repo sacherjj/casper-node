@@ -1,7 +1,7 @@
 use casper_types::{
     account,
     account::AccountHash,
-    auction::{Auction, MintProvider, RuntimeProvider, StorageProvider, SystemProvider},
+    auction::{Auction, EraInfo, MintProvider, RuntimeProvider, StorageProvider, SystemProvider},
     bytesrepr::{FromBytes, ToBytes},
     system_contract_errors::auction::Error,
     ApiError, CLTyped, CLValue, Key, TransferredTo, URef, BLAKE2B_DIGEST_LENGTH, U512,
@@ -32,7 +32,7 @@ where
     fn write<T: ToBytes + CLTyped>(&mut self, uref: URef, value: T) -> Result<(), Error> {
         let cl_value = CLValue::from_t(value).unwrap();
         self.context
-            .write_gs(uref.into(), StoredValue::CLValue(cl_value))
+            .metered_write_gs(uref.into(), StoredValue::CLValue(cl_value))
             .map_err(|_| Error::Storage)
     }
 }
@@ -55,10 +55,17 @@ where
         source: URef,
         target: URef,
         amount: U512,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ApiError> {
         let mint_contract_hash = self.get_mint_contract();
-        self.mint_transfer(mint_contract_hash, source, target, amount)
-            .map_err(|_| Error::Transfer)
+        match self.mint_transfer(mint_contract_hash, None, source, target, amount, None) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(api_error)) => Err(api_error),
+            Err(_) => Err(ApiError::Transfer),
+        }
+    }
+
+    fn record_era_info(&mut self, era_id: u64, era_info: EraInfo) -> Result<(), Error> {
+        Runtime::record_era_info(self, era_id, era_info).map_err(|_| Error::RecordEraInfo)
     }
 }
 
@@ -97,7 +104,7 @@ where
         target: AccountHash,
         amount: U512,
     ) -> Result<TransferredTo, ApiError> {
-        self.transfer_from_purse_to_account(source, target, amount)
+        self.transfer_from_purse_to_account(source, target, amount, None)
             .expect("should transfer from purse to account")
     }
 
@@ -106,15 +113,12 @@ where
         source: URef,
         target: URef,
         amount: U512,
-    ) -> Result<(), ()> {
-        let mint_contract_key = self.get_mint_contract();
-        if self
-            .mint_transfer(mint_contract_key, source, target, amount)
-            .is_ok()
-        {
-            Ok(())
-        } else {
-            Err(())
+    ) -> Result<(), ApiError> {
+        let mint_contract_hash = self.get_mint_contract();
+        match self.mint_transfer(mint_contract_hash, None, source, target, amount, None) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(api_error)) => Err(api_error),
+            Err(_) => Err(ApiError::Transfer),
         }
     }
 
@@ -132,6 +136,12 @@ where
         let mint_contract = self.get_mint_contract();
         self.mint_mint(mint_contract, amount)
             .map_err(|_| Error::MintReward)
+    }
+
+    fn reduce_total_supply(&mut self, amount: U512) -> Result<(), Error> {
+        let mint_contract = self.get_mint_contract();
+        self.mint_reduce_total_supply(mint_contract, amount)
+            .map_err(|_| Error::MintReduceTotalSupply)
     }
 }
 

@@ -13,40 +13,43 @@ mod tests;
 mod traits;
 
 use std::{
-    convert::Infallible,
+    convert::{Infallible, TryInto},
     fmt::{self, Debug, Display, Formatter},
+    time::Duration,
 };
 
 use datasize::DataSize;
+use derive_more::From;
+use hex_fmt::HexFmt;
+use serde::{Deserialize, Serialize};
+use tracing::error;
 
 use casper_execution_engine::core::engine_state::era_validators::GetEraValidatorsError;
 use casper_types::auction::ValidatorWeights;
 
 use crate::{
-    components::{storage::Storage, Component},
+    components::Component,
     crypto::{asymmetric_key::PublicKey, hash::Digest},
     effect::{
         announcements::ConsensusAnnouncement,
         requests::{
-            self, BlockExecutorRequest, BlockValidationRequest, ContractRuntimeRequest,
-            DeployBufferRequest, NetworkRequest, StorageRequest,
+            self, BlockExecutorRequest, BlockProposerRequest, BlockValidationRequest,
+            ContractRuntimeRequest, NetworkRequest, StorageRequest,
         },
         EffectBuilder, Effects,
     },
     protocol::Message,
-    types::{BlockHash, BlockHeader, CryptoRngCore, ProtoBlock, Timestamp},
+    types::{BlockHash, BlockHeader, ProtoBlock, Timestamp},
+    NodeRng,
 };
 
 pub use config::Config;
 pub(crate) use consensus_protocol::{BlockContext, EraEnd};
-use derive_more::From;
 pub(crate) use era_supervisor::{EraId, EraSupervisor};
-use hex_fmt::HexFmt;
-use serde::{Deserialize, Serialize};
-use tracing::error;
+pub(crate) use protocols::highway::HighwayProtocol;
 use traits::NodeIdT;
 
-#[derive(Debug, DataSize, Clone, Serialize, Deserialize)]
+#[derive(DataSize, Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
     /// A protocol message, to be handled by the instance in the specified era.
     Protocol { era_id: EraId, payload: Vec<u8> },
@@ -77,6 +80,12 @@ pub enum Event<I> {
         proto_block: ProtoBlock,
         valid: bool,
     },
+    /// Deactivate the era with the given ID, unless the number of faulty validators increases.
+    DeactivateEra {
+        era_id: EraId,
+        faulty_num: usize,
+        delay: Duration,
+    },
     /// Event raised when a new era should be created: once we get the set of validators, the
     /// booking block hash and the seed from the key block
     CreateNewEra {
@@ -88,6 +97,25 @@ pub enum Event<I> {
         key_block_seed: Result<Digest, u64>,
         get_validators_result: Result<Option<ValidatorWeights>, GetEraValidatorsError>,
     },
+    /// An event instructing us to shutdown if the latest era received no votes
+    Shutdown,
+    /// An event fired when the joiner reactor transitions into validator.
+    FinishedJoining(Timestamp),
+}
+
+impl Debug for ConsensusMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsensusMessage::Protocol { era_id, payload: _ } => {
+                write!(f, "Protocol {{ era_id.0: {}, .. }}", era_id.0)
+            }
+            ConsensusMessage::EvidenceRequest { era_id, pub_key } => f
+                .debug_struct("EvidenceRequest")
+                .field("era_id.0", &era_id.0)
+                .field("pub_key", pub_key)
+                .finish(),
+        }
+    }
 }
 
 impl Display for ConsensusMessage {
@@ -141,6 +169,13 @@ impl<I: Debug> Display for Event<I> {
                 if *valid { "valid" } else { "invalid" },
                 proto_block
             ),
+            Event::DeactivateEra {
+                era_id, faulty_num, ..
+            } => write!(
+                f,
+                "Deactivate old era {} unless additional faults are observed; faults so far: {}",
+                era_id.0, faulty_num
+            ),
             Event::CreateNewEra {
                 booking_block_hash,
                 key_block_seed,
@@ -152,6 +187,10 @@ impl<I: Debug> Display for Event<I> {
                 response to get_validators from the contract runtime: {:?}",
                 booking_block_hash, key_block_seed, get_validators_result
             ),
+            Event::Shutdown => write!(f, "Shutdown if current era is inactive"),
+            Event::FinishedJoining(timestamp) => {
+                write!(f, "The node finished joining the network at {}", timestamp)
+            }
         }
     }
 }
@@ -162,11 +201,11 @@ pub trait ReactorEventT<I>:
     From<Event<I>>
     + Send
     + From<NetworkRequest<I, Message>>
-    + From<DeployBufferRequest>
-    + From<ConsensusAnnouncement>
+    + From<BlockProposerRequest>
+    + From<ConsensusAnnouncement<I>>
     + From<BlockExecutorRequest>
     + From<BlockValidationRequest<ProtoBlock, I>>
-    + From<StorageRequest<Storage>>
+    + From<StorageRequest>
     + From<ContractRuntimeRequest>
 {
 }
@@ -175,11 +214,11 @@ impl<REv, I> ReactorEventT<I> for REv where
     REv: From<Event<I>>
         + Send
         + From<NetworkRequest<I, Message>>
-        + From<DeployBufferRequest>
-        + From<ConsensusAnnouncement>
+        + From<BlockProposerRequest>
+        + From<ConsensusAnnouncement<I>>
         + From<BlockExecutorRequest>
         + From<BlockValidationRequest<ProtoBlock, I>>
-        + From<StorageRequest<Storage>>
+        + From<StorageRequest>
         + From<ContractRuntimeRequest>
 {
 }
@@ -195,7 +234,7 @@ where
     fn handle_event(
         &mut self,
         effect_builder: EffectBuilder<REv>,
-        mut rng: &mut dyn CryptoRngCore,
+        mut rng: &mut NodeRng,
         event: Self::Event,
     ) -> Effects<Self::Event> {
         let mut handling_es = self.handling_wrapper(effect_builder, &mut rng);
@@ -217,6 +256,11 @@ where
                 proto_block,
                 valid,
             } => handling_es.resolve_validity(era_id, sender, proto_block, valid),
+            Event::DeactivateEra {
+                era_id,
+                faulty_num,
+                delay,
+            } => handling_es.handle_deactivate_era(era_id, faulty_num, delay),
             Event::CreateNewEra {
                 block_header,
                 booking_block_hash,
@@ -240,7 +284,16 @@ where
                     panic!("couldn't get the seed from the key block");
                 });
                 let validators = match get_validators_result {
-                    Ok(Some(result)) => result,
+                    Ok(Some(validator_weights)) => validator_weights
+                        .into_iter()
+                        .filter_map(|(key, stake)| match key.try_into() {
+                            Ok(key) => Some((key, stake)),
+                            Err(error) => {
+                                error!(%error, "error converting the bonded key");
+                                None
+                            }
+                        })
+                        .collect(),
                     result => {
                         error!(
                             ?result,
@@ -258,6 +311,8 @@ where
                     validators,
                 )
             }
+            Event::Shutdown => handling_es.shutdown_if_necessary(),
+            Event::FinishedJoining(timestamp) => handling_es.finished_joining(timestamp),
         }
     }
 }
