@@ -4,6 +4,7 @@ import json
 import pathlib
 import pickle
 import time
+from collections import defaultdict
 
 from era_validators import parse_era_validators
 
@@ -24,8 +25,8 @@ from era_validators import parse_era_validators
 # hash-2141636bcf5e15ecced219e53c813b96f99ec8a3bbe31066872b61be49355ce2
 AUCTION_HASH = 'hash-0681e58982fc60e93ca415f80327f4b8888435064503672f78b294fc96521aa7'
 
-NODE_ADDRESS = 'http://54.67.67.33:7777'
-CHAIN_NAME = 'casper-delta-2'
+NODE_ADDRESS = 'http://13.56.210.126:7777'
+CHAIN_NAME = 'release-test-6'
 
 GET_GLOBAL_STATE_COMMAND = ["casper-client", "get-global-state-hash", "--node-address", NODE_ADDRESS]
 
@@ -214,9 +215,26 @@ def get_deploy_hashs_per_block():
         print(f"{header['era_id']} - {header['height']} - {header['proposer']} - {header['deploy_hashes']}")
 
 
-# save_block_info()
-get_deploy_hashs_per_block()
+def get_proposer_per_era():
+    eras = []
+    cur_era = -1
+    for block in get_all_blocks():
+        header = block['header']
+        proposer = header['proposer']
+        era = header['era_id']
+        if cur_era != era:
+            cur_era = era
+            eras.append(defaultdict(int))
+        eras[era][proposer] += 1
+    return eras
 
+# save_block_info()
+#get_deploy_hashs_per_block()
+
+era_proposers = get_proposer_per_era()
+print(era_proposers)
+for era_id, era in enumerate(era_proposers):
+    print(era_id, list(era.values()))
 
 # era_validators = filtered_era_validators(all_blocks)
 # save_validator_by_key(era_validators)
