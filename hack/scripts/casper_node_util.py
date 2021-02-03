@@ -24,8 +24,8 @@ from era_validators import parse_era_validators
 # hash-2141636bcf5e15ecced219e53c813b96f99ec8a3bbe31066872b61be49355ce2
 AUCTION_HASH = 'hash-0681e58982fc60e93ca415f80327f4b8888435064503672f78b294fc96521aa7'
 
-NODE_ADDRESS = 'http://54.67.67.33:7777'
-CHAIN_NAME = 'casper-delta-2'
+NODE_ADDRESS = 'http://54.183.27.75:7777'
+CHAIN_NAME = 'release-test-16'
 
 GET_GLOBAL_STATE_COMMAND = ["casper-client", "get-global-state-hash", "--node-address", NODE_ADDRESS]
 
@@ -68,6 +68,11 @@ def deploy_saved_deploy_to_node(node_addr, deploy_file):
 def get_global_state_hash():
     response = _subprocess_call_with_json(GET_GLOBAL_STATE_COMMAND, "global_state_hash")
     return response["global_state_hash"]
+
+
+def get_deploy(deploy_hash: str):
+    response = _subprocess_call_with_json(["casper-client", "get-deploy", "--node-address", NODE_ADDRESS, deploy_hash], "result")
+    return response
 
 
 def get_era_validators(global_state_hash):
@@ -118,6 +123,24 @@ def get_all_blocks():
     pickle.dump(blocks, open(cached_blocks_file, "wb"))
     return blocks
 
+
+def get_all_deploys():
+    """
+    retrieves all deploys on chain and caches
+
+    will be REALLY slow with large downloads as calls are throttled.
+    """
+    cached_deploys_file = pathlib.Path(os.path.realpath(__file__)).parent / "deploy_cache"
+    if pathlib.Path.exists(cached_deploys_file):
+        deploys = pickle.load(open(cached_deploys_file, "rb"))
+    else:
+        deploys = {}
+    for block in get_all_blocks():
+        for deploy_hash in block["header"]["deploy_hashes"]:
+            if deploy_hash not in deploys.keys():
+                deploys[deploy_hash] = get_deploy(deploy_hash)
+    pickle.dump(deploys, open(cached_deploys_file, "wb"))
+    return deploys
 
 # current_global_state_hash = get_global_state_hash()
 # print(get_era_validators(current_global_state_hash))
@@ -214,8 +237,24 @@ def get_deploy_hashs_per_block():
         print(f"{header['era_id']} - {header['height']} - {header['proposer']} - {header['deploy_hashes']}")
 
 
+
+
 # save_block_info()
-get_deploy_hashs_per_block()
+#get_deploy_hashs_per_block()
+# for block in get_all_blocks():
+#     # print(block)
+#     header = block["header"]
+#     deploy_count = len(header['deploy_hashes'])
+#     for deploy in header['deploy_hashes']:
+#         deploy_obj = get_deploy(deploy)
+#         print(deploy_obj)
+#     transfer_count = len(header['transfer_hashes'])
+#     if deploy_count > 2 or transfer_count > 2:
+#         print(f"{header['era_id']}-{header['height']} {deploy_count} {transfer_count}")
+
+
+for deploy in get_all_deploys():
+    print(deploy)
 
 
 # era_validators = filtered_era_validators(all_blocks)
