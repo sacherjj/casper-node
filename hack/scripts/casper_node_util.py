@@ -22,8 +22,10 @@ from era_validators import parse_era_validators
 #
 # casper-client query-state --node-address http://localhost:7777 -k $(cat /etc/casper/validator_keys/public_key_hex) -s $(casper-client get-state-root-hash --node-address http://127.0.0.1:7777 | jq -r '.["result"]["state_root_hash"]') | jq -r '.["result"]["stored_value"]["Account"]["named_keys"]["auction"]'
 #
+# casper-client query-state --node-address http://3.18.112.103:7777 -k $(cat ~/aws/keys/joe/public_key_hex) -s $(casper-client get-state-root-hash --node-address http://3.18.112.103:7777 | jq -r .result.state_root_hash) | jq .result.stored_value.Account.named_keys
+#
 # hash-2141636bcf5e15ecced219e53c813b96f99ec8a3bbe31066872b61be49355ce2
-AUCTION_HASH = 'hash-0681e58982fc60e93ca415f80327f4b8888435064503672f78b294fc96521aa7'
+AUCTION_HASH = 'hash-71feb0a0853a728317764587db6178887ff751230ac1c524f59f09c9ea53fd7a'
 
 NODE_ADDRESS = 'http://13.56.210.126:7777'
 CHAIN_NAME = 'release-test-6'
