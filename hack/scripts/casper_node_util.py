@@ -4,7 +4,6 @@ import json
 import pathlib
 import pickle
 import time
-from collections import defaultdict
 
 from era_validators import parse_era_validators
 
@@ -73,6 +72,11 @@ def get_global_state_hash():
     return response["global_state_hash"]
 
 
+def get_deploy(deploy_hash: str):
+    response = _subprocess_call_with_json(["casper-client", "get-deploy", "--node-address", NODE_ADDRESS, deploy_hash], "result")
+    return response
+
+
 def get_era_validators(global_state_hash):
     command = ["casper-client", "query-state",
                "--node-address", NODE_ADDRESS,
@@ -121,6 +125,24 @@ def get_all_blocks():
     pickle.dump(blocks, open(cached_blocks_file, "wb"))
     return blocks
 
+
+def get_all_deploys():
+    """
+    retrieves all deploys on chain and caches
+
+    will be REALLY slow with large downloads as calls are throttled.
+    """
+    cached_deploys_file = pathlib.Path(os.path.realpath(__file__)).parent / "deploy_cache"
+    if pathlib.Path.exists(cached_deploys_file):
+        deploys = pickle.load(open(cached_deploys_file, "rb"))
+    else:
+        deploys = {}
+    for block in get_all_blocks():
+        for deploy_hash in block["header"]["deploy_hashes"]:
+            if deploy_hash not in deploys.keys():
+                deploys[deploy_hash] = get_deploy(deploy_hash)
+    pickle.dump(deploys, open(cached_deploys_file, "wb"))
+    return deploys
 
 # current_global_state_hash = get_global_state_hash()
 # print(get_era_validators(current_global_state_hash))
@@ -232,6 +254,20 @@ def get_proposer_per_era():
 
 # save_block_info()
 #get_deploy_hashs_per_block()
+# for block in get_all_blocks():
+#     # print(block)
+#     header = block["header"]
+#     deploy_count = len(header['deploy_hashes'])
+#     for deploy in header['deploy_hashes']:
+#         deploy_obj = get_deploy(deploy)
+#         print(deploy_obj)
+#     transfer_count = len(header['transfer_hashes'])
+#     if deploy_count > 2 or transfer_count > 2:
+#         print(f"{header['era_id']}-{header['height']} {deploy_count} {transfer_count}")
+
+
+for deploy in get_all_deploys():
+    print(deploy)
 
 era_proposers = get_proposer_per_era()
 print(era_proposers)

@@ -134,20 +134,25 @@ echo "Package version set to: $PACKAGE_VERSION"
 #  # get just the body required by bintray, strip off vault payload
 #  export BINTRAY_API_KEY=$(/bin/cat $CREDENTIAL_FILE_TMP | jq -r .data.bintray_api_key)
 #fi
-export BINTRAY_API_KEY='811cdee0cc8d1750adc4d603f358f192bf67c8cc'
+export BINTRAY_API_KEY=$BINTRAY_PROD_TOKEN
 
-CURL_AUTH=" --basic -u $BINTRAY_USER:$BINTRAY_API_KEY"
+CURL_AUTH=" -u$BINTRAY_USER:$BINTRAY_API_KEY"
 VERSION_URL="$API_URL/packages/$BINTRAY_REPO_URL/versions/$PACKAGE_VERSION"
 PACKAGE_FILES="$API_URL/packages/$BINTRAY_REPO_URL/versions/$PACKAGE_VERSION/files"
 echo $VERSION_URL
 # Get files
-FILES_TO_DELETE=$(curl -s "$CURL_AUTH" "$PACKAGE_FILES" | jq -r '[.[] | .name | select(.[-3:] == "deb")] | .[58:] | .[]')
+FILES_TO_DELETE=$(curl -s "$PACKAGE_FILES" | jq -r '[.[] | .name | select(.[-3:] == "deb")] | .[10:] | .[]')
+
 for deb_file in $FILES_TO_DELETE
 do
+  # /content/:subject/:repo/:file_path
   echo "$deb_file"
-  curl "$CURL_AUTH" -X "DELETE" "$API_URL/packages/$BINTRAY_REPO_URL/$deb_file"
+  curl $CURL_AUTH -X DELETE $API_URL/content/$BINTRAY_ORG_NAME/$BINTRAY_REPO_NAME/$deb_file
+  echo
+
   echo "$deb_file.asc"
-  curl "$CURL_AUTH" -X "DELETE" "$API_URL/packages/$BINTRAY_REPO_URL/$deb_file.asc"
+  curl $CURL_AUTH -X DELETE $API_URL/content/$BINTRAY_ORG_NAME/$BINTRAY_REPO_NAME/$deb_file.asc
+  echo
 done
 
 
@@ -209,3 +214,9 @@ done
 #  echo "[ERRROR] Unable to find uploaded packages on bintray - missing $DEB_ASC_FILE_NAME"
 #  exit 1
 #fi
+<<<<<<< HEAD
+=======
+
+
+#https://casperlabs.bintray.com/casper-debian-tests/:casper-node_0.2.0-2690_amd64.deb
+>>>>>>> origin/python-helper-scripts
