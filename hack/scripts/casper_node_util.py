@@ -26,8 +26,8 @@ from era_validators import parse_era_validators
 # hash-2141636bcf5e15ecced219e53c813b96f99ec8a3bbe31066872b61be49355ce2
 AUCTION_HASH = 'hash-71feb0a0853a728317764587db6178887ff751230ac1c524f59f09c9ea53fd7a'
 
-NODE_ADDRESS = 'http://13.56.210.126:7777'
-CHAIN_NAME = 'release-test-6'
+NODE_ADDRESS = 'http://3.18.112.103:7777'
+CHAIN_NAME = 'delta-10'
 
 GET_GLOBAL_STATE_COMMAND = ["casper-client", "get-global-state-hash", "--node-address", NODE_ADDRESS]
 
@@ -48,6 +48,22 @@ def _subprocess_call(command, expect_text) -> str:
 
 def _subprocess_call_with_json(command, expect_text) -> dict:
     return json.loads(_subprocess_call(command, expect_text))
+
+
+def get_auction_info(node_addr):
+    command = ["casper-client", "get-auction-info",
+               "--node-address", node_addr]
+    return _subprocess_call_with_json(command, '"bids":')
+
+
+def get_last_auction_era(node_addr):
+    gai = get_auction_info(node_addr)
+    era_validators = gai["result"]["era_validators"]
+    return era_validators[-1]
+
+
+def get_auction_era_key_weight(era):
+    return [(v["public_key"], int(v["weight"])) for v in era["validator_weights"]]
 
 
 def deploy_do_nothing_to_node(node_addr):
@@ -266,13 +282,13 @@ def get_proposer_per_era():
 #         print(f"{header['era_id']}-{header['height']} {deploy_count} {transfer_count}")
 
 
-for deploy in get_all_deploys():
-    print(deploy)
-
-era_proposers = get_proposer_per_era()
-print(era_proposers)
-for era_id, era in enumerate(era_proposers):
-    print(era_id, list(era.values()))
+# for deploy in get_all_deploys():
+#     print(deploy)
+#
+# era_proposers = get_proposer_per_era()
+# print(era_proposers)
+# for era_id, era in enumerate(era_proposers):
+#     print(era_id, list(era.values()))
 
 # era_validators = filtered_era_validators(all_blocks)
 # save_validator_by_key(era_validators)
@@ -289,3 +305,26 @@ for era_id, era in enumerate(era_proposers):
 
 # for node in CL_NODE_ADDRESSES:
 #     deploy_saved_deploy_to_node(node, '~/repos/casper-node/do_nothing_deploy')
+
+def get_weight_differences():
+    key_weight = get_auction_era_key_weight(get_last_auction_era(NODE_ADDRESS))
+    max_weight = max([v[1] for v in key_weight])
+    return [(v[0], max_weight - v[1]) for v in key_weight]
+
+
+def balance_by_delegation():
+    for pub_key, to_delegate in get_weight_differences():
+        if to_delegate == 0:
+            continue
+        command = ["casper-client", "put-deploy",
+                   "--chain-name", "delta-10",
+                   "--node-address", NODE_ADDRESS,
+                   "--secret-key", "/home/sacherjj/aws/keys/joe/secret_key.pem",
+                   "--session-path", "/home/sacherjj/repos/casper-node/target/wasm32-unknown-unknown/release/delegate.wasm",
+                   "--payment-amount", "1000000000",
+                   "--session-arg", f"\"validator:public_key='{pub_key}'\"",
+                   "--session-arg", f"\"amount:u512='{to_delegate}'\"",
+                   "--session-arg", "\"delegator:public_key='0186d42bacf67a4b6c5042edba6bc736769171ca3320f7b0040ab9265aca13bbee'\""]
+        print(' '.join(command))
+
+balance_by_delegation()
