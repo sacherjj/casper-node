@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
 
   steps:
-    - uses: actions/checkout@v4
+    - name: Checkout branch
+      uses: actions/checkout@v4
       with:
         ref: ${{ github.event.inputs.branch_to_run }}
 
