@@ -1,6 +1,9 @@
 name: Dev-Net deploy
 
 on:
+  pull_request:
+    branches:
+      - dev-build-test
   workflow_dispatch:
     inputs:
       branch_to_run:
