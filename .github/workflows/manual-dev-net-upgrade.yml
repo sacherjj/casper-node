@@ -1,0 +1,62 @@
+name: Dev-Net deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_to_run:
+        description: 'Branch to pull latest from'
+        type: string
+        default: 'dev' # Default to dev branch
+        required: true
+
+jobs:
+  publish_protocol:
+    runs-on: ubuntu-latest
+
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch_to_run }}
+
+    - name: Display Branch
+      run: echo "Running on branch ${{ github.event.inputs.branch_to_run }}"
+
+    - name: Set CURRENT_HASH as environment variable
+      run: echo "CURRENT_HASH=${{ github.sha }}" >> $GITHUB_ENV
+
+    - name: Get latest dev-net protocol git hash
+      run: echo "LATEST_HASH=$(curl -s https://genesis.casper.network/dev-net/latest_git_hash | tr -d '\n')" >> $GITHUB_ENV
+
+    - name: Check if publish is needed
+      run: |
+        echo "Latest Protocol Published Hash: ${{ env.LATEST_HASH }}"
+        echo "Current Github Hash: ${{ env.CURRENT_HASH }}"
+        if [ "${{ env.CURRENT_HASH }}" != "${{ env.LATEST_HASH }}" ]; then
+            echo "Last published dev-net protocol has same hash, erroring out.  "
+            exit 1 # This fails job and stops workflow
+        fi
+
+    - name: Create directory and root files
+      run: |
+         LATEST_PROTOCOL_VERSION="$(curl -s https://genesis.casper.network/dev-net/protocol_versions | tail -n 1 | tr -d '\n')"
+         IFS="_"
+         # Read latest protocol parts into array
+         read -ra LPVA <<< "$LATEST_PROTOCOL_VERSION"
+         # Incrementing one to patch
+         NEW_PROTOCOL_VERSION=${CVPA[0]}_${svp[1]}_$((${svp[2]} + 1))
+        mkdir -p "root_s3/${{ env.NEW_PROTOCOL_VERSION }}"
+        echo ${{ env.NEW_PROTOCOL_VERSION }} >> root_s3/protocol_versions
+        echo $${{ env.CURRENT_HASH }} >> root_s3/latest_git_hash
+        mkdir config
+
+    - name: Get bin and config files
+      run: |
+        curl -JLO "http://genesis.casper.network/artifacts/casper-node/${{ env.LATEST_HASH }}/bin.tar.gz"
+        curl -JLO "http://genesis.casper.network/artifacts/casper-node/${{ env.LATEST_HASH }}/config.tar.gz"
+        cd config
+        tar -xzvf ../config.tar.gz .
+        mv bin.tar.gz "root_s3/${{ env.NEW_PROTOCOL_VERSION }}/
+
+    - name: List Files
+      run: |
+        ls -r root_s3
