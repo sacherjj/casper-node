@@ -1,0 +1,19 @@
+name: manual-dispatch-install
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Package to install'
+        required: true
+        type: string
+jobs:
+    test-setup:
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Setup required packages
+          run: |
+            sudo mkdir -m 0755 -p /etc/apt/keyrings/
+            sudo curl https://repo.casper.network/casper-repo-pubkey.gpg --output /etc/apt/keyrings/casper-repo-pubkey.gpg
+            sudo echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/casper-repo-pubkey.gpg] https://repo.casper.network/releases jammy main" | sudo tee /etc/apt/sources.list.d/casper.list
+            sudo apt-get install casper-client -y
